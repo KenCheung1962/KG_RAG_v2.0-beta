@@ -1,0 +1,9 @@
+INFO:     Started server process [14409]
+INFO:     Waiting for application startup.
+2026-03-25 19:46:53,727 - INFO - Connecting to PgBouncer at localhost:5432/kg_rag
+2026-03-25 19:46:53,826 - INFO - PgBouncer connection pool established successfully
+2026-03-25 19:46:53,829 - INFO - pgvector extension verified
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+[minimax.py] Timeout Configuration: EMBEDDING_TIMEOUT=120.0s, LLM_TIMEOUT=180.0s
+INFO:     127.0.0.1:57672 - "GET /health HTTP/1.1" 200 OK

@@ -1,0 +1,24 @@
+# Dependencies
+frontend/node_modules/
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Logs
+*.log
+*.log.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build artifacts
+*.egg-info/
+dist/
+build/

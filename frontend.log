@@ -1,0 +1,29 @@
+
+> lightrag-webui@1.0.0 dev
+> vite
+
+
+  VITE v5.4.21  ready in 204 ms
+
+  ➜  Local:   http://localhost:8081/
+  ➜  Network: http://10.0.1.12:8081/
+2:44:16 AM [vite] hmr update /src/styles.css
+2:44:20 AM [vite] hmr update /src/styles.css
+3:01:04 AM [vite] hmr update /src/styles.css
+8:01:14 AM [vite] http proxy error: /health
+AggregateError [ECONNREFUSED]: 
+    at internalConnectMultiple (node:net:1139:18)
+    at afterConnectMultiple (node:net:1712:7)
+5:39:15 PM [vite] page reload src/config.ts
+5:39:28 PM [vite] page reload src/components/tabs/QueryTab.ts
+5:45:17 PM [vite] page reload src/main.ts
+6:11:48 PM [vite] page reload src/components/tabs/QueryFileTab.ts
+6:14:37 PM [vite] page reload src/components/tabs/QueryFileTab.ts
+6:14:49 PM [vite] page reload src/components/tabs/QueryFileTab.ts
+6:14:59 PM [vite] page reload src/components/tabs/QueryFileTab.ts
+6:21:18 PM [vite] page reload src/components/tabs/QueryTab.ts
+6:21:38 PM [vite] page reload src/components/tabs/IngestTab.ts
+6:42:44 PM [vite] page reload src/components/tabs/QueryFileTab.ts
+6:43:19 PM [vite] page reload src/components/tabs/QueryFileTab.ts
+6:43:47 PM [vite] page reload src/components/tabs/QueryFileTab.ts
+7:02:14 PM [vite] page reload src/components/tabs/QueryFileTab.ts

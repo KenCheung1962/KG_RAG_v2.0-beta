@@ -1,0 +1,263 @@
+#==============================================================================
+# KG RAG System v1.2-beta - Configuration File
+#==============================================================================
+# This file controls the initialization and startup behavior of the KG RAG system.
+# Modify these settings to customize your deployment.
+#==============================================================================
+
+#------------------------------------------------------------------------------
+# Service Configuration
+#------------------------------------------------------------------------------
+services:
+  # Backend API Configuration (pgvector_api.py)
+  backend:
+    enabled: true
+    port: 8002
+    host: "127.0.0.1"
+    script: "pgvector_api.py"
+    directory: "backend"
+    log_file: "backend.log"
+    startup_timeout: 30  # seconds
+    health_check:
+      endpoint: "/health"
+      retries: 5
+      interval: 2  # seconds
+    
+  # Frontend WebUI Configuration (Vite)
+  frontend:
+    enabled: true
+    port: 8081
+    host: true  # Listen on all interfaces
+    directory: "frontend"
+    log_file: "frontend.log"
+    startup_timeout: 15  # seconds
+    auto_install_deps: true  # Run npm install if node_modules missing
+    
+  # Database Management API (Node.js)
+  db_management_api:
+    enabled: true
+    port: 8013
+    script: "scripts/db_management_api.cjs"
+    directory: "frontend"
+    log_file: "db-api.log"
+    startup_timeout: 10
+    
+#------------------------------------------------------------------------------
+# Ollama Configuration
+#------------------------------------------------------------------------------
+ollama:
+  enabled: true
+  host: "http://localhost"
+  port: 11434
+  required_models:
+    - "nomic-embed-text"  # Required for embeddings
+  check_on_startup: true
+  auto_pull_models: false  # Set to true to auto-pull missing models
+  
+#------------------------------------------------------------------------------
+# Database Health Check Thresholds
+#------------------------------------------------------------------------------
+database_health:
+  # Minimum counts for "healthy" status
+  min_entities: 1000
+  min_relationships: 1000
+  min_chunks: 1000
+  min_documents: 10
+  
+  # Warning thresholds (below these shows warning)
+  warn_entities: 500
+  warn_relationships: 500
+  warn_chunks: 500
+  warn_documents: 5
+  
+  # Check connection on startup
+  check_on_startup: true
+  
+#------------------------------------------------------------------------------
+# Logging Configuration
+#------------------------------------------------------------------------------
+logging:
+  # Log levels: DEBUG, INFO, WARN, ERROR
+  level: "INFO"
+  
+  # Log file settings
+  backend:
+    enabled: true
+    file: "backend.log"
+    max_size: "10MB"
+    max_backups: 3
+    
+  frontend:
+    enabled: true
+    file: "frontend.log"
+    max_size: "10MB"
+    max_backups: 3
+    
+  db_api:
+    enabled: true
+    file: "db-api.log"
+    max_size: "10MB"
+    max_backups: 3
+    
+  startup:
+    enabled: true
+    file: "startup.log"
+    console_output: true
+    
+#------------------------------------------------------------------------------
+# Proxy Configuration (Vite)
+#------------------------------------------------------------------------------
+proxy:
+  # API proxy routes
+  api:
+    path: "/api"
+    target_port: 8002
+    change_origin: true
+    
+  health:
+    path: "/health"
+    target_port: 8002
+    
+  pgvector:
+    path: "/pgvector-api"
+    target_port: 8002
+    rewrite: true
+    
+  pgvector_docker:
+    path: "/pgvector-proxy"
+    target_port: 8012
+    enabled: false  # Only enable if using Docker
+    
+  db_api:
+    path: "/db-api"
+    target_port: 8013
+    rewrite: true
+    
+#------------------------------------------------------------------------------
+# Feature Flags
+#------------------------------------------------------------------------------
+features:
+  # Enable/disable specific features
+  webui: true
+  chat_interface: true
+  document_upload: true
+  knowledge_graph_view: true
+  database_management: true
+  backup_restore: true
+  upload_failure_tracking: true
+  
+  # Development features
+  hot_reload: true
+  debug_mode: false
+  verbose_logging: false
+  
+#------------------------------------------------------------------------------
+# Security Configuration
+#------------------------------------------------------------------------------
+security:
+  # API Key for internal communication
+  api_key: "static-internal-key"
+  
+  # CORS settings
+  cors:
+    enabled: true
+    origins:
+      - "http://localhost:8081"
+      - "http://127.0.0.1:8081"
+      
+  # File upload restrictions
+  upload:
+    max_file_size_mb: 200
+    allowed_extensions:
+      - "pdf"
+      - "docx"
+      - "txt"
+      - "html"
+      - "md"
+    blocked_extensions:
+      - ".exe"
+      - ".bat"
+      - ".sh"
+      - ".py"
+      - ".js"
+      
+#------------------------------------------------------------------------------
+# Performance Tuning
+#------------------------------------------------------------------------------
+performance:
+  # Backend settings
+  backend:
+    workers: 1  # Number of worker processes (1 for dev, increase for prod)
+    threads: true  # Enable threading
+    max_requests: 0  # 0 = unlimited
+    
+  # Frontend settings
+  frontend:
+    hmr: true  # Hot Module Replacement
+    source_maps: true
+    
+  # Database connection pool
+  database:
+    pool_size: 10
+    max_overflow: 20
+    pool_timeout: 30
+    
+#------------------------------------------------------------------------------
+# Paths Configuration
+#------------------------------------------------------------------------------
+paths:
+  # Base directories (relative to v1.2-beta root)
+  backend_dir: "backend"
+  frontend_dir: "frontend"
+  unified_indexing_dir: "unified_indexing"
+  
+  # Data directories
+  uploads_dir: "./uploads"
+  backups_dir: "./backups"
+  logs_dir: "."
+  
+  # Virtual environment
+  venv_dir: "venv"
+  
+#------------------------------------------------------------------------------
+# Initialization Hooks
+#------------------------------------------------------------------------------
+initialization:
+  # Commands to run before starting services
+  pre_start:
+    - command: "echo 'Starting KG RAG initialization...'"
+      description: "Initialization start notification"
+      
+  # Commands to run after services are healthy
+  post_start:
+    - command: "echo 'All services started successfully'"
+      description: "Startup completion notification"
+      
+  # Health check custom endpoint
+  health_checks:
+    backend:
+      endpoint: "/health"
+      expected_status: 200
+      expected_response_contains: '"status":"healthy"'
+      
+#------------------------------------------------------------------------------
+# Notification Settings (Future)
+#------------------------------------------------------------------------------
+notifications:
+  enabled: false
+  on_startup: false
+  on_error: true
+  channels:
+    # Example: webhook, email, slack (future implementation)
+    - type: "console"
+      enabled: true
+      
+#------------------------------------------------------------------------------
+# Environment Overrides
+#------------------------------------------------------------------------------
+# These settings can be overridden by environment variables:
+# - KGRAG_BACKEND_PORT (overrides services.backend.port)
+# - KGRAG_FRONTEND_PORT (overrides services.frontend.port)
+# - KGRAG_OLLAMA_HOST (overrides ollama.host)
+# - KGRAG_LOG_LEVEL (overrides logging.level)
+# - KGRAG_DEBUG_MODE (overrides features.debug_mode)

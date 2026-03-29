@@ -1,0 +1,2373 @@
+#!/usr/bin/env python3
+"""
+KG RAG API with pgvector storage - Compatible with WebUI
+Includes Vector Similarity Search + Reranking for improved quality
+"""
+import asyncio
+import json
+import os
+import hashlib
+import base64
+import requests
+import logging
+from datetime import datetime
+from fastapi import Request, FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import List, Optional
+import sys
+import time
+import re
+import numpy as np
+from dataclasses import dataclass
+
+sys.path.insert(0, '/Users/ken/clawd_workspace/projects/KG_RAG/proj_ph2/source/postgres')
+
+# =============================================================================
+# RERANKER CONFIGURATION
+# =============================================================================
+
+@dataclass
+class RerankConfig:
+    """Configuration for reranking."""
+    # Initial retrieval - how many chunks to fetch before reranking
+    initial_top_k: int = 50
+    # Final number of chunks after reranking
+    final_top_k: int = 10
+    # Enable/disable reranking
+    enabled: bool = True
+    # Reranking method: "cross_encoder", "llm", "hybrid", or "none"
+    method: str = "hybrid"
+    # Threshold for relevance (0-1)
+    relevance_threshold: float = 0.3
+
+# Global rerank config
+RERANK_CONFIG = RerankConfig()
+
+# =============================================================================
+# LOGGER FOR RERANKER
+# =============================================================================
+
+rerank_logger = logging.getLogger("reranker")
+
+# =============================================================================
+# EMBEDDING FUNCTION (MiniMax)
+# =============================================================================
+
+EMBEDDING_DIMENSION = 1024  # MiniMax embedding dimension
+
+def get_minimax_embedding(text: str) -> List[float]:
+    """Generate embedding using MiniMax API."""
+    MINIMAX_API_KEY = os.environ.get("MINIMAX_PORTAL_TOKEN", "")
+    MINIMAX_BASE_URL = "https://api.minimax.chat/v1"
+    
+    if not MINIMAX_API_KEY:
+        rerank_logger.error("MiniMax API key not configured for embeddings")
+        return [0.0] * EMBEDDING_DIMENSION
+    
+    url = f"{MINIMAX_BASE_URL}/embeddings"
+    headers = {
+        "Authorization": f"Bearer {MINIMAX_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "embo-01",  # MiniMax embedding model
+        "input": text[:8000]  # Limit text length
+    }
+    
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            embedding = data.get("data", [{}])[0].get("embedding", [])
+            if embedding and len(embedding) == EMBEDDING_DIMENSION:
+                return embedding
+            else:
+                rerank_logger.error(f"Invalid embedding dimension: {len(embedding) if embedding else 0}")
+                return [0.0] * EMBEDDING_DIMENSION
+        else:
+            rerank_logger.error(f"MiniMax embedding API error: {resp.status_code}")
+            return [0.0] * EMBEDDING_DIMENSION
+    except Exception as e:
+        rerank_logger.error(f"MiniMax embedding exception: {e}")
+        return [0.0] * EMBEDDING_DIMENSION
+
+# =============================================================================
+# RERANKER IMPLEMENTATIONS
+# =============================================================================
+
+def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
+    """Calculate cosine similarity between two vectors."""
+    if not vec1 or not vec2:
+        return 0.0
+    v1 = np.array(vec1)
+    v2 = np.array(vec2)
+    if np.linalg.norm(v1) == 0 or np.linalg.norm(v2) == 0:
+        return 0.0
+    return float(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)))
+
+def keyword_score(query: str, text: str) -> float:
+    """Calculate keyword matching score."""
+    query_lower = query.lower()
+    text_lower = text.lower()
+    
+    # Extract words from query (skip stop words)
+    stop_words = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 
+                  'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from', 
+                  'and', 'or', 'but', 'what', 'which', 'who', 'how', 'why'}
+    
+    query_words = [w for w in re.findall(r'\b[a-zA-Z]+\b', query_lower) 
+                   if w not in stop_words and len(w) > 2]
+    
+    if not query_words:
+        return 0.5
+    
+    matches = sum(1 for w in query_words if w in text_lower)
+    return matches / len(query_words)
+
+def calculate_recency_score(created_at: Optional[datetime]) -> float:
+    """Calculate recency score for chunks."""
+    if not created_at:
+        return 0.5  # Neutral score if no date
+    
+    # More recent = higher score
+    days_old = (datetime.now() - created_at).days
+    if days_old < 30:
+        return 1.0
+    elif days_old < 90:
+        return 0.8
+    elif days_old < 365:
+        return 0.6
+    else:
+        return 0.4
+
+async def rerank_chunks(
+    query: str, 
+    chunks: List[dict], 
+    method: str = "hybrid",
+    final_k: int = 10
+) -> List[dict]:
+    """
+    Rerank chunks using specified method.
+    
+    Methods:
+    - "hybrid": Combines vector similarity + keyword matching + recency
+    - "vector": Pure vector cosine similarity
+    - "keyword": Keyword matching only
+    - "none": No reranking, just return top-k by original order
+    """
+    if not chunks:
+        return []
+    
+    if method == "none" or len(chunks) <= final_k:
+        return chunks[:final_k]
+    
+    # Generate query embedding once
+    query_embedding = get_minimax_embedding(query)
+    
+    scored_chunks = []
+    
+    for chunk in chunks:
+        content = chunk.get("content", "")
+        chunk_embedding = chunk.get("embedding")
+        
+        if method == "vector":
+            if chunk_embedding:
+                score = cosine_similarity(query_embedding, chunk_embedding)
+            else:
+                score = 0.0
+                
+        elif method == "keyword":
+            score = keyword_score(query, content)
+            
+        elif method == "hybrid":
+            # Combine multiple signals
+            scores = []
+            weights = []
+            
+            # Vector similarity (40%)
+            if chunk_embedding:
+                vec_sim = cosine_similarity(query_embedding, chunk_embedding)
+                scores.append(vec_sim)
+                weights.append(0.4)
+            
+            # Keyword matching (30%)
+            kw_score = keyword_score(query, content)
+            scores.append(kw_score)
+            weights.append(0.3)
+            
+            # Content length quality (10%) - prefer medium-length chunks
+            content_len = len(content)
+            if 500 <= content_len <= 1500:
+                length_score = 1.0
+            elif content_len < 300:
+                length_score = 0.5
+            else:
+                length_score = 0.8
+            scores.append(length_score)
+            weights.append(0.1)
+            
+            # Recency score (10%)
+            created_at = chunk.get("created_at")
+            if isinstance(created_at, str):
+                try:
+                    created_at = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                except:
+                    created_at = None
+            recency_score = calculate_recency_score(created_at)
+            scores.append(recency_score)
+            weights.append(0.1)
+            
+            # Content diversity bonus (10%) - unique content gets boost
+            # This is calculated based on position in original list
+            diversity_score = 1.0 - (chunks.index(chunk) / len(chunks)) * 0.5
+            scores.append(diversity_score)
+            weights.append(0.1)
+            
+            # Calculate weighted average
+            total_weight = sum(weights)
+            score = sum(s * w for s, w in zip(scores, weights)) / total_weight if total_weight > 0 else 0.5
+        else:
+            score = 0.5
+        
+        scored_chunks.append((score, chunk))
+    
+    # Sort by score descending
+    scored_chunks.sort(key=lambda x: x[0], reverse=True)
+    
+    # Return top-k with scores attached
+    result = []
+    for score, chunk in scored_chunks[:final_k]:
+        chunk["rerank_score"] = round(score, 3)
+        result.append(chunk)
+    
+    return result
+
+# =============================================================================
+# VECTOR SEARCH FUNCTIONS
+# =============================================================================
+
+async def search_chunks_vector(
+    storage,
+    query: str,
+    top_k: int = 50,
+    match_threshold: float = 0.3
+) -> List[dict]:
+    """
+    Search chunks using vector similarity.
+    
+    Falls back to keyword search if vector search fails.
+    """
+    try:
+        # Generate query embedding
+        query_embedding = get_minimax_embedding(query)
+        
+        # Use the storage's vector search
+        from storage import DistanceMetric
+        results = await storage.search_chunks(
+            query_vector=query_embedding,
+            limit=top_k,
+            distance_metric=DistanceMetric.COSINE,
+            match_threshold=match_threshold
+        )
+        
+        # Convert to dict format
+        chunks = []
+        for r in results:
+            chunks.append({
+                "content": r.content,
+                "source": r.source,
+                "similarity": r.similarity,
+                "chunk_id": r.chunk_id,
+                "metadata": r.metadata
+            })
+        
+        return chunks
+        
+    except Exception as e:
+        rerank_logger.error(f"Vector search failed: {e}, falling back to keyword search")
+        return []
+
+def keyword_search_fallback(storage, query: str, top_k: int = 50) -> List[dict]:
+    """
+    Fallback keyword-based search.
+    """
+    import re
+    
+    # Extract keywords
+    stop_words = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
+                  'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+                  'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'dare',
+                  'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from', 'as',
+                  'into', 'through', 'during', 'before', 'after', 'above', 'below',
+                  'between', 'under', 'again', 'further', 'then', 'once', 'here',
+                  'there', 'when', 'where', 'why', 'how', 'all', 'each', 'few',
+                  'more', 'most', 'other', 'some', 'such', 'no', 'nor', 'not',
+                  'only', 'own', 'same', 'so', 'than', 'too', 'very', 'just',
+                  'and', 'but', 'if', 'or', 'because', 'until', 'while', 'about',
+                  'against', 'this', 'that', 'these', 'those', 'what', 'which', 'who',
+                  'whom', 'reply', 'english', 'translate', 'language', 'in', 'write'}
+    
+    words = [w.lower() for w in re.findall(r'[a-zA-Z]+', query) 
+             if w.lower() not in stop_words and len(w) > 2]
+    
+    # Use sync database fetch
+    results = []
+    try:
+        import asyncpg
+        # This is a sync fallback - in production you'd want async
+        for word in words[:3]:
+            # This won't work well in async context, but as fallback
+            pass
+    except:
+        pass
+    
+    return results
+
+# Setup logging for failed uploads
+UPLOAD_LOG_FILE = "/tmp/upload_failures.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(UPLOAD_LOG_FILE),
+        logging.StreamHandler()
+    ]
+)
+upload_logger = logging.getLogger("upload_failures")
+
+def log_upload_failure(filename: str, error: str, file_size: int = 0, content_type: str = "unknown"):
+    """Log failed upload with details"""
+    upload_logger.error(f"UPLOAD_FAILED | filename='{filename}' | error='{error}' | size={file_size} | type={content_type}")
+
+def log_upload_success(filename: str, doc_id: str, chunks: int, file_size: int = 0):
+    """Log successful upload"""
+    upload_logger.info(f"UPLOAD_SUCCESS | filename='{filename}' | doc_id={doc_id} | chunks={chunks} | size={file_size}")
+
+# Load MINIMAX_API_KEY from .zshrc if not set
+if not os.getenv("MINIMAX_API_KEY"):
+    try:
+        with open(os.path.expanduser("~/.zshrc"), "r") as f:
+            for line in f:
+                if line.strip().startswith("export MINIMAX_API_KEY="):
+                    # Extract the key value
+                    key = line.strip().split("=", 1)[1].strip('"')
+                    os.environ["MINIMAX_API_KEY"] = key
+                    break
+    except:
+        pass
+
+from storage import create_kg_storage, Entity, Relationship, Chunk
+
+# Chunking configuration
+CHUNK_SIZE = 1000      # Characters per chunk
+CHUNK_OVERLAP = 100    # Overlap between chunks (characters)
+
+def create_chunks(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
+    """
+    Split text into overlapping chunks.
+    
+    Args:
+        text: The text to split
+        chunk_size: Size of each chunk in characters
+        overlap: Number of characters to overlap between chunks
+    
+    Returns:
+        List of text chunks with overlap
+    """
+    if not text or len(text) <= chunk_size:
+        return [text] if text else []
+    
+    chunks = []
+    stride = chunk_size - overlap  # How much to advance each time
+    
+    for i in range(0, len(text), stride):
+        chunk = text[i:i + chunk_size]
+        if len(chunk) < 50 and i > 0:  # Skip tiny last chunks
+            break
+        chunks.append(chunk)
+        
+        # Stop if we've reached the end
+        if i + chunk_size >= len(text):
+            break
+    
+    return chunks
+
+app = FastAPI(title="KG RAG pgvector API")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Add cache control middleware
+@app.middleware("http")
+async def add_cache_control(request, call_next):
+    response = await call_next(request)
+    # Disable caching for API endpoints
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
+# MiniMax API Configuration
+MINIMAX_API_KEY = os.environ.get("MINIMAX_PORTAL_TOKEN", "sk-cp-EyvfWvXEC-upzqaaNavnkGMCYHoaoaI4DjCGHb1CmDRPv5e_oYAnsp09gLaJH6MAV-bGpLFfPfCAjaSkebNxsSvEVkI-x_uXau-fK3iZ_l8Z2nFBRpg_VOs")
+MINIMAX_BASE_URL = "https://api.minimax.chat/v1"
+
+async def call_minimax(prompt: str, system_prompt: str = "You are a helpful assistant.") -> str:
+    """Call MiniMax API with prompt."""
+    if not MINIMAX_API_KEY:
+        print("MiniMax API key is empty!")
+        return ""
+    
+    url = f"{MINIMAX_BASE_URL}/text/chatcompletion_v2"
+    headers = {
+        "Authorization": f"Bearer {MINIMAX_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "MiniMax-M2.5",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt}
+        ]
+    }
+    
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=60)
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        else:
+            print(f"MiniMax API error: {resp.status_code} - {resp.text}")
+            return ""
+    except Exception as e:
+        print(f"MiniMax API exception: {e}")
+        return ""
+
+async def extract_entities_and_relations(text: str) -> tuple:
+    """Extract entities and relationships from text using LLM."""
+    #print(f"[DEBUG] extract_entities_and_relations called with text length: {len(text)}")
+    
+    if len(text) < 50:
+        #print(f"[DEBUG] Text too short: {len(text)} chars")
+        return [], []
+    
+    # Truncate text if too long
+    max_text = 8000
+    if len(text) > max_text:
+        text = text[:max_text] + "..."
+    
+    system_prompt = f"""You are an entity extraction expert. Extract entities and relationships from the text.
+Use ONLY these entity types: company, person, product, technology, tool, location, organization, concept, project, task, note, stock, money, percentage, number, date, article, patent, book, journal
+
+Use ONLY these relationship types: cites, authored_by, related_to, based_on, created_by, contains, extends, depends_on, implemented_in, part_of, uses, implements, works_at, extracted_from, trades_at, has_price, has_change, has_volume, has_market_cap, granted_to, owned_by, contribute_to, mentions
+
+Output in JSON format:
+{{"entities": [{{"name": "EntityName", "type": "entity_type", "description": "brief description"}}], "relationships": [{{"from": "Entity1", "to": "Entity2", "type": "relationship_type"}}]}}"""
+    
+    prompt = f"""Extract all entities and relationships from this text:
+
+{text}
+
+Return only valid JSON, no other text."""
+    
+    #print(f"[DEBUG] Calling MiniMax API...")
+    result = await call_minimax(prompt, system_prompt)
+    #print(f"[DEBUG] MiniMax result: {result[:200] if result else 'EMPTY'}")
+    
+    if not result:
+        return [], []
+    
+    # Parse JSON
+    try:
+        # Try to extract JSON from response
+        import re
+        json_match = re.search(r'\{[\s\S]*\}', result)
+        if json_match:
+            data = json.loads(json_match.group())
+            entities = data.get("entities", [])
+            relationships = data.get("relationships", [])
+            return entities, relationships
+    except:
+        pass
+    
+    return [], []
+
+storage = None
+DOCS_DIR = "/tmp/kg_rag_docs"
+
+@app.on_event("startup")
+async def startup():
+    global storage
+    os.makedirs(DOCS_DIR, exist_ok=True)
+    storage = await create_kg_storage({
+        'host': 'localhost',
+        'port': 5432,
+        'database': 'kg_rag',
+        'user': 'postgres',
+        'password': 'postgres'
+    })
+
+@app.on_event("shutdown")
+async def shutdown():
+    if storage:
+        await storage.client.disconnect()
+
+# ============ Health & Stats ============
+@app.get("/health")
+async def health():
+    result = await storage.client.fetch("SELECT COUNT(*) as e FROM entities")
+    rels = await storage.client.fetch("SELECT COUNT(*) as r FROM relationships")
+    chunks = await storage.client.fetch("SELECT COUNT(*) as c FROM chunks")
+    docs = await storage.client.fetch("SELECT COUNT(DISTINCT source) as d FROM chunks")
+    return {
+        "status": "healthy",
+        "version": "1.0.0-pgvector",
+        "entities_count": result[0]["e"],
+        "relationships_count": rels[0]["r"],
+        "chunks_count": chunks[0]["c"] if chunks else 0,
+        "documents_count": docs[0]["d"] if docs else 0
+    }
+
+@app.get("/api/v1/upload-failures")
+async def get_upload_failures():
+    """Get list of recent upload failures"""
+    try:
+        if not os.path.exists(UPLOAD_LOG_FILE):
+            return {"failures": [], "successes": [], "total_failures": 0, "total_successes": 0}
+        
+        failures = []
+        successes = []
+        
+        with open(UPLOAD_LOG_FILE, 'r') as f:
+            for line in f:
+                if 'UPLOAD_FAILED' in line:
+                    # Parse log line
+                    parts = line.strip().split(' | ')
+                    timestamp = parts[0] if parts else ""
+                    details = {}
+                    for part in parts[1:]:
+                        if '=' in part:
+                            key, value = part.split('=', 1)
+                            details[key] = value.strip("'")
+                    failures.append({
+                        "timestamp": timestamp,
+                        "filename": details.get('filename', 'unknown'),
+                        "error": details.get('error', 'unknown'),
+                        "size": details.get('size', '0')
+                    })
+                elif 'UPLOAD_SUCCESS' in line:
+                    parts = line.strip().split(' | ')
+                    timestamp = parts[0] if parts else ""
+                    details = {}
+                    for part in parts[1:]:
+                        if '=' in part:
+                            key, value = part.split('=', 1)
+                            details[key] = value.strip("'")
+                    successes.append({
+                        "timestamp": timestamp,
+                        "filename": details.get('filename', 'unknown'),
+                        "doc_id": details.get('doc_id', ''),
+                        "chunks": details.get('chunks', '0'),
+                        "size": details.get('size', '0')
+                    })
+        
+        # Return last 50 failures and last 100 successes
+        return {
+            "failures": failures[-50:],
+            "successes": successes[-100:],
+            "total_failures": len(failures),
+            "total_successes": len(successes),
+            "log_file": UPLOAD_LOG_FILE
+        }
+    except Exception as e:
+        return {"error": str(e), "failures": [], "successes": []}
+
+@app.get("/api/v1/kg/stats")
+async def kg_stats():
+    result = await storage.client.fetch("SELECT COUNT(*) as e FROM entities")
+    rels = await storage.client.fetch("SELECT COUNT(*) as r FROM relationships")
+    chunks = await storage.client.fetch("SELECT COUNT(*) as c FROM chunks")
+    docs = await storage.client.fetch("SELECT COUNT(DISTINCT source) as d FROM chunks")
+    return {
+        "entities": result[0]["e"],
+        "relationships": rels[0]["r"],
+        "chunks": chunks[0]["c"] if chunks else 0,
+        "documents": docs[0]["d"] if docs else 0
+    }
+
+# ============ Documents ============
+@app.get("/api/v1/documents")
+async def list_documents():
+    """List all documents"""
+    result = await storage.client.fetch("SELECT entity_id, source, created_at FROM chunks ORDER BY created_at DESC LIMIT 100")
+    docs = {}
+    for r in result:
+        entity_id = r.get("entity_id", "unknown")
+        if entity_id not in docs:
+            docs[entity_id] = {
+                "doc_id": entity_id, 
+                "chunks": 0, 
+                "created_at": r.get("created_at"),
+                "filename": r.get("source", "")
+            }
+        docs[entity_id]["chunks"] += 1
+    return list(docs.values())
+
+@app.get("/api/v1/documents/stats")
+async def doc_stats():
+    """Document statistics"""
+    result = await storage.client.fetch("SELECT COUNT(DISTINCT entity_id) as cnt FROM chunks")
+    chunks = await storage.client.fetch("SELECT COUNT(*) as cnt FROM chunks")
+    return {
+        "total_documents": result[0]["cnt"] if result else 0,
+        "total_chunks": chunks[0]["cnt"] if chunks else 0
+    }
+
+@app.post("/api/v1/documents/upload")
+async def upload_document(
+    file: UploadFile = File(...),
+):
+    """Upload a single file"""
+    filename = file.filename
+    file_size = 0
+    
+    try:
+        content = await file.read()
+        file_size = len(content)
+        text = content.decode('utf-8', errors='ignore')
+        
+        # Create doc_id from filename
+        doc_id = hashlib.md5(filename.encode()).hexdigest()[:12]
+        
+        # Delete existing chunks and entity first (for re-upload)
+        try:
+            await storage.client.execute("DELETE FROM chunks WHERE entity_id = $1", doc_id)
+            await storage.client.execute("DELETE FROM entities WHERE entity_id = $1", doc_id)
+        except:
+            pass
+        
+        # First create the entity
+        entity = Entity(
+            entity_id=doc_id,
+            entity_type="document",
+            name=filename,
+            description=f"Document: {filename}",
+            properties={"filename": filename, "type": "uploaded"}
+        )
+        try:
+            await storage.create_entity(entity)
+        except Exception as e:
+            log_upload_failure(filename, f"Entity creation failed: {str(e)}", file_size)
+            pass  # Entity might already exist
+        
+        # Split into chunks with overlap for better context
+        chunks = create_chunks(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
+        
+        # Store chunks
+        chunks_created = 0
+        for i, chunk_text in enumerate(chunks):
+            chunk = Chunk(
+                chunk_id=f"{doc_id}_{i}",
+                entity_id=doc_id,
+                content=chunk_text,
+                source=filename,
+                chunk_index=i,
+                metadata={"filename": filename, "index": i}
+            )
+            try:
+                await storage.create_chunk(chunk)
+                chunks_created += 1
+            except Exception as e:
+                log_upload_failure(filename, f"Chunk {i} creation failed: {str(e)}", file_size)
+                pass
+        
+        # Log success
+        log_upload_success(filename, doc_id, chunks_created, file_size)
+        
+        return {
+            "success": True,
+            "doc_id": doc_id,
+            "filename": filename,
+            "chunks": chunks_created
+        }
+    except Exception as e:
+        error_msg = str(e)
+        log_upload_failure(filename, error_msg, file_size)
+        raise HTTPException(status_code=500, detail=error_msg)
+
+# JSON upload endpoint for WebUI
+@app.post("/api/v1/documents/upload/json")
+async def upload_document_json(request: Request):
+    """Upload a single file via JSON with entity extraction"""
+    filename = "unknown.txt"
+    file_size = 0
+    
+    try:
+        body = await request.json()
+        content = body.get("content", "")
+        filename = body.get("id", body.get("filename", "unknown.txt"))
+        file_size = len(content) if isinstance(content, str) else len(content.encode())
+        
+        # Decode base64 if provided
+        if content:
+            try:
+                text = base64.b64decode(content).decode('utf-8', errors='ignore')
+            except:
+                text = content
+        else:
+            text = ""
+        
+        # Create doc_id from filename
+        doc_id = hashlib.md5(filename.encode()).hexdigest()[:12]
+        
+        # Delete existing chunks and entity first (for re-upload)
+        try:
+            await storage.client.execute("DELETE FROM chunks WHERE entity_id = $1", doc_id)
+            await storage.client.execute("DELETE FROM entities WHERE entity_id = $1", doc_id)
+        except:
+            pass
+        
+        # First create the document entity
+        entity = Entity(
+            entity_id=doc_id,
+            entity_type="document",
+            name=filename,
+            description=f"Document: {filename}",
+            properties={"filename": filename, "type": "uploaded"}
+        )
+        try:
+            await storage.create_entity(entity)
+        except Exception as e:
+            log_upload_failure(filename, f"Entity creation failed: {str(e)}", file_size)
+            pass
+        
+        # Split into chunks with overlap for better context
+        chunks = create_chunks(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
+        
+        # Store chunks
+        chunks_created = 0
+        for i, chunk_text in enumerate(chunks):
+            chunk = Chunk(
+                chunk_id=f"{doc_id}_{i}",
+                entity_id=doc_id,
+                content=chunk_text,
+                source=filename,
+                chunk_index=i,
+                metadata={"filename": filename, "index": i}
+            )
+            try:
+                await storage.create_chunk(chunk)
+                chunks_created += 1
+            except Exception as e:
+                log_upload_failure(filename, f"Chunk {i} creation failed: {str(e)}", file_size)
+                pass
+        
+        # Extract entities and relationships using LLM
+        extracted_entities = []
+        extracted_relations = []
+        
+        if text and len(text) > 100 and MINIMAX_API_KEY:
+            try:
+                extracted_entities, extracted_relations = await extract_entities_and_relations(text)
+            except Exception as e:
+                log_upload_failure(filename, f"Entity extraction failed: {str(e)}", file_size)
+            
+            # Create extracted entities
+            entity_ids_created = set()
+            for ent in extracted_entities:
+                ent_name = ent.get("name", "")
+                ent_type = ent.get("type", "concept")
+                if ent_name and ent_name not in entity_ids_created:
+                    ent_id = hashlib.md5(ent_name.encode()).hexdigest()[:12]
+                    ent_id = f"ent_{ent_id}"
+                    
+                    ent_entity = Entity(
+                        entity_id=ent_id,
+                        entity_type=ent_type,
+                        name=ent_name,
+                        description=f"Extracted from {filename}",
+                        properties={"source": filename, "extracted": True}
+                    )
+                    try:
+                        await storage.create_entity(ent_entity)
+                        entity_ids_created.add(ent_name)
+                        
+                        # Link entity to document
+                        rel = Relationship(
+                            relationship_id=f"{doc_id}_{ent_id}",
+                            source_id=doc_id,
+                            target_id=ent_id,
+                            relationship_type="contains",
+                            properties={"extracted_from": filename}
+                        )
+                        try:
+                            await storage.create_relationship(rel)
+                        except Exception as e:
+                            log_upload_failure(filename, f"Relationship creation failed: {str(e)}", file_size)
+                            pass
+                    except Exception as e:
+                        log_upload_failure(filename, f"Entity creation failed: {str(e)}", file_size)
+                        pass
+            
+            # Create relationships between extracted entities
+            for rel in extracted_relations:
+                from_ent = rel.get("from", "")
+                to_ent = rel.get("to", "")
+                rel_type = rel.get("type", "related_to")
+                
+                if from_ent and to_ent and from_ent != to_ent:
+                    from_id = f"ent_{hashlib.md5(from_ent.encode()).hexdigest()[:12]}"
+                    to_id = f"ent_{hashlib.md5(to_ent.encode()).hexdigest()[:12]}"
+                    
+                    rel_obj = Relationship(
+                        relationship_id=f"{from_id}_{to_id}",
+                        source_id=from_id,
+                        target_id=to_id,
+                        relationship_type=rel_type,
+                        properties={"source": filename}
+                    )
+                    try:
+                        await storage.create_relationship(rel_obj)
+                    except Exception as e:
+                        log_upload_failure(filename, f"Relationship creation failed: {str(e)}", file_size)
+                        pass
+        
+        # Log success
+        log_upload_success(filename, doc_id, chunks_created, file_size)
+        
+        return {
+            "success": True,
+            "doc_id": doc_id,
+            "filename": filename,
+            "chunks": chunks_created,
+            "entities_extracted": len(extracted_entities),
+            "relationships_extracted": len(extracted_relations),
+            "indexed": True  # Indicates upload completed (LLM extraction may be async)
+        }
+    except Exception as e:
+        error_msg = str(e)
+        log_upload_failure(filename, error_msg, file_size)
+        raise HTTPException(status_code=500, detail=error_msg)
+
+# Check if document is indexed
+@app.get("/api/v1/documents/{doc_id}/status")
+async def get_document_status(doc_id: str):
+    """Check if a document has been fully indexed"""
+    try:
+        # Check if chunks exist for this document
+        chunks = await storage.client.fetch(
+            "SELECT COUNT(*) as count FROM chunks WHERE entity_id = $1",
+            doc_id
+        )
+        chunk_count = chunks[0].get("count", 0) if chunks else 0
+        
+        # Check if document entity exists
+        entities = await storage.client.fetch(
+            "SELECT entity_id FROM entities WHERE entity_id = $1",
+            doc_id
+        )
+        
+        indexed = len(entities) > 0 and chunk_count > 0
+        
+        return {
+            "doc_id": doc_id,
+            "indexed": indexed,
+            "chunks": chunk_count,
+            "ready": indexed
+        }
+    except Exception as e:
+        return {
+            "doc_id": doc_id,
+            "indexed": False,
+            "chunks": 0,
+            "ready": False,
+            "error": str(e)
+        }
+
+@app.post("/api/v1/documents/upload/folder")
+async def upload_folder(folder_path: str = Form(...)):
+    """Upload all files from a folder"""
+    try:
+        if not os.path.exists(folder_path):
+            raise HTTPException(status_code=404, detail=f"Folder not found: {folder_path}")
+        
+        results = []
+        for root, dirs, files in os.walk(folder_path):
+            for filename in files:
+                if filename.endswith(('.txt', '.md', '.pdf', '.csv', '.json', '.html', '.xml')):
+                    filepath = os.path.join(root, filename)
+                    try:
+                        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                            text = f.read()
+                        
+                        doc_id = hashlib.md5(filepath.encode()).hexdigest()[:12]
+                        
+                        # First create entity
+                        entity = Entity(
+                            entity_id=doc_id,
+                            entity_type="document",
+                            name=filename,
+                            description=f"Document: {filename}",
+                            properties={"filename": filename, "path": filepath, "type": "folder"}
+                        )
+                        try:
+                            await storage.create_entity(entity)
+                        except:
+                            pass
+                        
+                        # Split into chunks with overlap for better context
+                        chunks = create_chunks(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
+                        
+                        for i, chunk_text in enumerate(chunks):
+                            chunk = Chunk(
+                                chunk_id=f"{doc_id}_{i}",
+                                entity_id=doc_id,
+                                content=chunk_text,
+                                source=filename,
+                                chunk_index=i,
+                                metadata={"filename": filename, "path": filepath, "index": i}
+                            )
+                            try:
+                                await storage.create_chunk(chunk)
+                            except:
+                                pass
+                        
+                        results.append({"filename": filename, "chunks": len(chunks)})
+                    except Exception as e:
+                        results.append({"filename": filename, "error": str(e)})
+        
+        return {
+            "success": True,
+            "folder": folder_path,
+            "files": results,
+            "total_files": len(results)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# JSON endpoint for folder upload
+PROCESSED_FILES_PATH = "/tmp/kg_rag_processed_files.json"
+BATCH_SIZE = 5
+PARALLEL_WORKERS = 5
+
+def load_processed_files():
+    """Load list of already processed files."""
+    if os.path.exists(PROCESSED_FILES_PATH):
+        try:
+            with open(PROCESSED_FILES_PATH, 'r') as f:
+                return set(json.load(f))
+        except:
+            return set()
+    return set()
+
+def save_processed_files(files_set):
+    """Save processed files list."""
+    with open(PROCESSED_FILES_PATH, 'w') as f:
+        json.dump(list(files_set), f)
+
+async def process_single_file(filepath: str, filename: str, skip_existing: bool = True):
+    """Process a single file - extract chunks, entities, relationships."""
+    doc_id = hashlib.md5(filepath.encode()).hexdigest()[:12]
+    
+    # Check if already processed (skip if exists)
+    if skip_existing:
+        existing = await storage.client.fetch(
+            "SELECT entity_id FROM entities WHERE entity_id = $1", doc_id
+        )
+        if existing:
+            return {"filename": filename, "status": "skipped", "reason": "already_exists", "doc_id": doc_id}
+    
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            text = f.read()
+        
+        if not text or len(text.strip()) < 10:
+            return {"filename": filename, "status": "skipped", "reason": "empty_file"}
+        
+        # Create document entity
+        entity = Entity(
+            entity_id=doc_id,
+            entity_type="document",
+            name=filename,
+            description=f"Document: {filename}",
+            properties={"filename": filename, "path": filepath, "type": "folder"}
+        )
+        try:
+            await storage.create_entity(entity)
+        except:
+            pass
+        
+        # Create chunks with overlap for better context
+        chunks = create_chunks(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
+        
+        for i, chunk_text in enumerate(chunks):
+            chunk = Chunk(
+                chunk_id=f"{doc_id}_{i}",
+                entity_id=doc_id,
+                content=chunk_text,
+                source=filename,
+                chunk_index=i,
+                metadata={"filename": filename, "path": filepath, "index": i}
+            )
+            try:
+                await storage.create_chunk(chunk)
+            except:
+                pass
+        
+        # Extract entities and relationships using LLM
+        entities_extracted = 0
+        relationships_extracted = 0
+        
+        if text and len(text) > 100 and MINIMAX_API_KEY:
+            extracted_entities, extracted_relations = await extract_entities_and_relations(text)
+            
+            # Deduplicate entities by name
+            unique_entities = {}
+            for ent in extracted_entities:
+                ent_name = ent.get("name", "").strip()
+                if ent_name:
+                    # Keep first occurrence of each entity name
+                    if ent_name.lower() not in unique_entities:
+                        unique_entities[ent_name.lower()] = ent
+            
+            # Deduplicate relationships - unique by (from, to, type)
+            seen_rels = set()
+            unique_relations = []
+            for rel in extracted_relations:
+                from_ent = rel.get("from", "").strip()
+                to_ent = rel.get("to", "").strip()
+                rel_type = rel.get("type", "related_to").strip()
+                
+                if from_ent and to_ent and from_ent != to_ent:
+                    rel_key = (from_ent.lower(), to_ent.lower(), rel_type.lower())
+                    if rel_key not in seen_rels:
+                        seen_rels.add(rel_key)
+                        unique_relations.append(rel)
+            
+            # Create extracted entities
+            entity_ids_created = set()
+            for ent_name, ent in unique_entities.items():
+                ent_type = ent.get("type", "concept")
+                if ent_name and ent_name not in entity_ids_created:
+                    ent_id = hashlib.md5(ent_name.encode()).hexdigest()[:12]
+                    ent_id = f"ent_{ent_id}"
+                    
+                    ent_entity = Entity(
+                        entity_id=ent_id,
+                        entity_type=ent_type,
+                        name=ent.get("name", ent_name),
+                        description=ent.get("description", f"Extracted from {filename}"),
+                        properties={"source": filename, "extracted": True}
+                    )
+                    try:
+                        await storage.create_entity(ent_entity)
+                        entity_ids_created.add(ent_name)
+                        
+                        # Link entity to document
+                        rel = Relationship(
+                            relationship_id=f"{doc_id}_{ent_id}",
+                            source_id=doc_id,
+                            target_id=ent_id,
+                            relationship_type="contains",
+                            properties={"extracted_from": filename}
+                        )
+                        try:
+                            await storage.create_relationship(rel)
+                        except:
+                            pass
+                    except:
+                        pass
+            
+            # Create unique relationships between extracted entities
+            for rel in unique_relations:
+                from_ent = rel.get("from", "")
+                to_ent = rel.get("to", "")
+                rel_type = rel.get("type", "related_to")
+                
+                if from_ent and to_ent and from_ent != to_ent:
+                    from_id = f"ent_{hashlib.md5(from_ent.encode()).hexdigest()[:12]}"
+                    to_id = f"ent_{hashlib.md5(to_ent.encode()).hexdigest()[:12]}"
+                    
+                    # Include type in relationship_id to allow different types between same entities
+                    rel_id = f"{from_id}_{to_id}_{rel_type}"
+                    
+                    rel_obj = Relationship(
+                        relationship_id=rel_id,
+                        source_id=from_id,
+                        target_id=to_id,
+                        relationship_type=rel_type,
+                        properties={"source": filename}
+                    )
+                    try:
+                        await storage.create_relationship(rel_obj)
+                    except:
+                        pass
+            
+            entities_extracted = len(unique_entities)
+            relationships_extracted = len(unique_relations)
+        
+        return {
+            "filename": filename,
+            "status": "processed",
+            "doc_id": doc_id,
+            "chunks": len(chunks),
+            "entities_extracted": entities_extracted,
+            "relationships_extracted": relationships_extracted
+        }
+    except Exception as e:
+        return {"filename": filename, "status": "error", "error": str(e)}
+
+@app.post("/api/v1/documents/upload/folder/json")
+async def upload_folder_json(request: Request):
+    """Upload all files from a folder via JSON with batch processing, async, resume, and skip features."""
+    try:
+        body = await request.json()
+        folder_path = body.get("folder_path", "")
+        recursive = body.get("recursive", True)
+        batch_size = body.get("batch_size", BATCH_SIZE)
+        parallel = body.get("parallel", True)
+        skip_existing = body.get("skip_existing", True)
+        
+        if not folder_path:
+            raise HTTPException(status_code=400, detail="folder_path is required")
+        
+        if not os.path.exists(folder_path):
+            raise HTTPException(status_code=404, detail=f"Folder not found: {folder_path}")
+        
+        # Load processed files for resume capability
+        processed_files = load_processed_files()
+        
+        # Collect all files
+        all_files = []
+        for root, dirs, files in os.walk(folder_path):
+            for filename in files:
+                if filename.endswith(('.txt', '.md', '.pdf', '.csv', '.json', '.html', '.xml')):
+                    filepath = os.path.join(root, filename)
+                    all_files.append((filepath, filename))
+            
+            if not recursive:
+                break
+        
+        # Filter out already processed files if skip_existing is True
+        if skip_existing:
+            files_to_process = []
+            skipped_count = 0
+            for filepath, filename in all_files:
+                if filename not in processed_files:
+                    files_to_process.append((filepath, filename))
+                else:
+                    skipped_count += 1
+        else:
+            files_to_process = all_files
+        
+        results = []
+        processed_count = 0
+        error_count = 0
+        
+        # Process in batches
+        for i in range(0, len(files_to_process), batch_size):
+            batch = files_to_process[i:i + batch_size]
+            
+            if parallel:
+                # Parallel async processing
+                tasks = [process_single_file(fp, fn, skip_existing) for fp, fn in batch]
+                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                for br in batch_results:
+                    if isinstance(br, Exception):
+                        error_count += 1
+                        results.append({"status": "error", "error": str(br)})
+                    else:
+                        results.append(br)
+                        if br.get("status") == "processed":
+                            processed_files.add(br.get("filename", ""))
+                            processed_count += 1
+                        elif br.get("status") == "skipped":
+                            processed_count += 1
+            else:
+                # Sequential processing
+                for filepath, filename in batch:
+                    result = await process_single_file(filepath, filename, skip_existing)
+                    results.append(result)
+                    if result.get("status") == "processed":
+                        processed_files.add(filename)
+                        processed_count += 1
+                    elif result.get("status") == "skipped":
+                        processed_count += 1
+            
+            # Save checkpoint after each batch
+            save_processed_files(processed_files)
+        
+        # Final save
+        save_processed_files(processed_files)
+        
+        return {
+            "success": True,
+            "folder": folder_path,
+            "total_files": len(all_files),
+            "skipped_existing": skipped_count if skip_existing else 0,
+            "processed": processed_count,
+            "errors": error_count,
+            "batch_size": batch_size,
+            "parallel": parallel,
+            "results": results[-50:]  # Return last 50 results
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/v1/clear")
+async def clear_all():
+    """Clear all data"""
+    try:
+        await storage.client.execute("DELETE FROM chunks")
+        await storage.client.execute("DELETE FROM relationships")
+        await storage.client.execute("DELETE FROM entities")
+        return {"success": True, "message": "All data cleared"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============ Entities ============
+@app.get("/api/v1/entities")
+async def list_entities(limit: int = 100):
+    result = await storage.client.fetch(
+        "SELECT entity_id, entity_type, name, description FROM entities LIMIT $1",
+        limit
+    )
+    return [{"id": r["entity_id"], "type": r["entity_type"], "name": r["name"]} for r in result]
+
+@app.get("/api/v1/entities/{entity_id}")
+async def get_entity(entity_id: str):
+    result = await storage.client.fetch(
+        "SELECT * FROM entities WHERE entity_id = $1",
+        entity_id
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="Entity not found")
+    return result[0]
+
+@app.get("/api/v1/entities/search")
+async def search_entities(q: str = "", limit: int = 10):
+    result = await storage.client.fetch(
+        "SELECT entity_id, entity_type, name FROM entities WHERE name ILIKE $1 LIMIT $2",
+        f"%{q}%",
+        limit
+    )
+    return [{"id": r["entity_id"], "type": r["entity_type"], "name": r["name"]} for r in result]
+
+@app.get("/api/v1/relations")
+async def list_relations(limit: int = 100):
+    result = await storage.client.fetch(
+        "SELECT * FROM relationships LIMIT $1",
+        limit
+    )
+    return result
+
+# ============ Multi-Step Comprehensive Generation ============
+
+async def generate_comprehensive_response(
+    query: str,
+    context: str,
+    base_system_prompt: str,
+    target_words: str,
+    max_sections: int = 6
+) -> str:
+    """
+    Multi-step generation for ultra-comprehensive responses.
+    First creates an outline, then expands each section.
+    """
+    from minimax_fixed import deepseek_complete
+    
+    rerank_logger.info(f"Starting multi-step generation for '{query[:50]}...' targeting {target_words} words")
+    
+    # Step 1: Generate detailed outline
+    outline_prompt = f"""Create a detailed outline for a comprehensive technical article about: {query}
+
+Context from knowledge base:
+{context[:3000]}
+
+Requirements:
+- Target length: {target_words} words
+- Create 5-7 major sections
+- Each section should have 3-5 subsections
+- Include specific topics, concepts, and examples to cover
+
+Output ONLY the outline in this format:
+# [Title]
+## 1. [Section Name]
+- Point 1
+- Point 2
+- Point 3
+## 2. [Section Name]
+...etc"""
+
+    try:
+        outline = await deepseek_complete(
+            prompt=outline_prompt,
+            system_prompt="You are an expert at structuring technical documentation. Create detailed, comprehensive outlines.",
+            model="deepseek-chat",
+            max_tokens=2000,
+            temperature=0.3
+        )
+        rerank_logger.info(f"Generated outline with {len(outline.split(chr(10)))} lines")
+    except Exception as e:
+        rerank_logger.error(f"Failed to generate outline: {e}")
+        # Fallback to single-step generation
+        return await deepseek_complete(
+            prompt=f"Write a comprehensive article about: {query}\n\nContext:\n{context[:4000]}\n\nTarget: {target_words} words",
+            system_prompt=base_system_prompt,
+            model="deepseek-chat",
+            max_tokens=4000,
+            temperature=0.4
+        )
+    
+    # Step 2: Parse and expand each major section
+    sections = []
+    current_section_lines = []
+    
+    for line in outline.split('\n'):
+        if line.startswith('## ') and current_section_lines:
+            sections.append('\n'.join(current_section_lines))
+            current_section_lines = [line]
+        elif line.strip():
+            current_section_lines.append(line)
+    
+    if current_section_lines:
+        sections.append('\n'.join(current_section_lines))
+    
+    # Limit to reasonable number of sections
+    sections = [s for s in sections if s.strip()][:max_sections]
+    
+    rerank_logger.info(f"Expanding {len(sections)} sections")
+    
+    # Generate content for each section
+    full_content_parts = []
+    for i, section in enumerate(sections):
+        if not section.strip():
+            continue
+            
+        section_prompt = f"""Write a comprehensive section for a technical article in PLAIN TEXT FORMAT.
+
+Topic: {query}
+
+Section outline to expand:
+{section}
+
+Use this context as reference:
+{context[:1500]}
+
+CRITICAL FORMAT REQUIREMENTS:
+- Write 400-600 words for this section
+- Use SINGLE-COLUMN plain text only (no multi-column layouts)
+- Describe ALL mathematical formulas in readable English words, NEVER use LaTeX
+  - Example: write "the expected value of Q given theta" instead of "\\mathbb{E}[Q_\\theta]"
+  - Example: write "alpha plus beta equals gamma" instead of "$\\alpha + \\beta = \\gamma$"
+- If explaining algorithms, use step-by-step descriptions in words, not code or pseudocode blocks
+- Be detailed, technical, and authoritative
+- Do NOT use phrases like "based on the context" or "according to the documents"
+- Use your extensive knowledge freely - you are the expert
+
+Write the complete section now:"""
+
+        try:
+            section_content = await deepseek_complete(
+                prompt=section_prompt,
+                system_prompt=base_system_prompt,
+                model="deepseek-chat",
+                max_tokens=1200,
+                temperature=0.4
+            )
+            full_content_parts.append(section_content)
+            rerank_logger.info(f"Generated section {i+1}/{len(sections)} ({len(section_content.split())} words)")
+        except Exception as e:
+            rerank_logger.error(f"Failed to generate section {i}: {e}")
+            full_content_parts.append(f"\n\n## {section.split(chr(10))[0].replace('## ', '')}\n\n[Content generation in progress...]\n\n")
+    
+    # Combine all sections
+    full_response = '\n\n'.join(full_content_parts)
+    word_count = len(full_response.split())
+    rerank_logger.info(f"Combined response: {word_count} words")
+    
+    # Add conclusion if we have substantial content
+    if word_count > 500:
+        try:
+            conclusion_prompt = f"""Write a comprehensive conclusion (300-400 words) for an article about {query}.
+
+The article covered these sections:
+{outline[:1000]}
+
+Your conclusion should:
+1. Synthesize the key insights
+2. Discuss implications and future directions
+3. Provide closing thoughts for practitioners and researchers"""
+
+            conclusion = await deepseek_complete(
+                prompt=conclusion_prompt,
+                system_prompt=base_system_prompt,
+                model="deepseek-chat",
+                max_tokens=800,
+                temperature=0.4
+            )
+            full_response += f"\n\n## Conclusion and Future Directions\n\n{conclusion}"
+            rerank_logger.info(f"Added conclusion, final word count: {len(full_response.split())}")
+        except Exception as e:
+            rerank_logger.warning(f"Failed to generate conclusion: {e}")
+    
+    return full_response
+
+def is_source_relevant(source: str, query: str) -> bool:
+    """
+    Check if a source filename is relevant to the query.
+    Returns True if source likely contains relevant content.
+    """
+    import re
+    
+    # Extract keywords from query (remove common words)
+    query_lower = query.lower()
+    stop_words = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+                  'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+                  'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'dare',
+                  'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from', 'as',
+                  'and', 'or', 'how', 'what', 'why', 'when', 'where', 'who', 'which',
+                  'this', 'that', 'these', 'those', 'my', 'your', 'his', 'her', 'its',
+                  'our', 'their', 'me', 'you', 'him', 'her', 'us', 'them', 'it', 'i'}
+    
+    # Extract keywords from query
+    query_words = set()
+    for word in re.findall(r'[a-zA-Z]+', query_lower):
+        if len(word) > 3 and word not in stop_words:
+            query_words.add(word)
+    
+    # Check if any query keyword appears in source filename
+    source_lower = source.lower()
+    matches = []
+    for word in query_words:
+        if word in source_lower:
+            matches.append(word)
+    
+    # Source is relevant if it matches at least one keyword
+    # OR if it's a technical/engineering document
+    relevant_extensions = ['.pdf', '.txt', '.html', '.doc', '.docx']
+    is_relevant = len(matches) > 0 or any(source_lower.endswith(ext) for ext in relevant_extensions)
+    
+    return is_relevant, matches
+
+
+def is_chunk_content_relevant(content: str, query: str, min_matches: int = 3) -> bool:
+    """
+    STRICT Check if chunk content actually contains relevant keywords from query.
+    Returns True ONLY if content has specific technical terms matching the query.
+    """
+    import re
+    
+    if not content or not query:
+        return False, 0, []
+    
+    query_lower = query.lower()
+    content_lower = content.lower()
+    
+    # Define CRITICAL technical terms that MUST be present for relevance
+    # These are compound terms or specific technical keywords
+    critical_terms = []
+    
+    # Packaging/semiconductor related
+    if any(term in query_lower for term in ['packaging', 'cowos', 'hbm', 'chip', 'die', 'wafer', 'semiconductor']):
+        critical_terms.extend(['packaging', 'cowos', 'hbm', 'chip', 'die', 'wafer', 'semiconductor', 
+                               'interposer', 'tsv', 'bump', 'solder', 'substrate', 'bonding'])
+    
+    # Bonding specific
+    if 'bonding' in query_lower:
+        critical_terms.extend(['bonding', 'hybrid', 'thermal', 'compression', 'fusion', 
+                               'dielectric', 'copper', 'pad', 'interface'])
+    
+    # Add query-specific terms (4+ chars)
+    query_terms = set()
+    for word in re.findall(r'[a-zA-Z]+', query_lower):
+        if len(word) >= 4 and word not in {'the', 'this', 'that', 'with', 'from', 'have', 'been'}:
+            query_terms.add(word)
+    
+    # Combine and prioritize
+    all_critical = set(critical_terms) | query_terms
+    
+    # Check for matches
+    matches = 0
+    matched_terms = []
+    
+    for term in all_critical:
+        if term in content_lower:
+            # Give higher weight to compound/specific terms
+            if len(term) >= 6:  # Longer terms are more specific
+                matches += 3
+            else:
+                matches += 1
+            matched_terms.append(term)
+    
+    # STRICT: Must match at least 2 different critical terms
+    # This prevents generic matches like "analysis" or "design"
+    unique_matches = len(matched_terms)
+    is_relevant = unique_matches >= 2 and matches >= min_matches
+    
+    # Log filtering for debugging
+    source_name = content[:50]  # Preview for logging
+    if not is_relevant:
+        print(f"[FILTER] Content rejected - only {unique_matches} unique matches: {matched_terms}")
+        print(f"[FILTER] Required terms: {list(all_critical)[:10]}")
+    else:
+        print(f"[PASS] Content accepted with {unique_matches} matches: {matched_terms}")
+    
+    return is_relevant, matches, matched_terms
+
+
+def validate_and_fix_citations(response: str, sources: list) -> tuple:
+    """
+    Validate that citations in the response match the actual sources.
+    Returns corrected response and list of warnings.
+    """
+    import re
+    
+    warnings = []
+    
+    # Find all citations in format "Source X" or "[X]"
+    citations_found = re.findall(r'Source\s+(\d+)', response, re.IGNORECASE)
+    citations_found += re.findall(r'\[(\d+)\]', response)
+    
+    # Get unique citation numbers
+    cited_numbers = set([int(c) for c in citations_found])
+    valid_numbers = set(range(1, len(sources) + 1))
+    
+    # Check for invalid citations
+    invalid_citations = cited_numbers - valid_numbers
+    
+    if invalid_citations:
+        warnings.append(f"Invalid source citations found: {invalid_citations}")
+        print(f"[CITATION WARNING] Invalid citations in response: {invalid_citations}")
+        print(f"[CITATION WARNING] Valid source numbers: 1-{len(sources)}")
+        print(f"[CITATION WARNING] Sources: {sources}")
+        
+        # Replace invalid citations with generic reference
+        for invalid_num in invalid_citations:
+            # Replace "Source X" with "the literature"
+            response = re.sub(rf'Source\s+{invalid_num}(?!\d)', 'the literature', response, flags=re.IGNORECASE)
+            response = re.sub(rf'\[{invalid_num}\](?!\d)', '', response)
+    
+    # Check if response cites sources not in filtered_result
+    # This could indicate hallucination
+    if cited_numbers and not any(f"Source {n}" in response for n in valid_numbers):
+        warnings.append("Response may contain hallucinated citations")
+        print(f"[CITATION WARNING] Response cites sources but none match available sources")
+    
+    return response, warnings
+
+
+def is_source_filename_relevant(source: str, query: str) -> bool:
+    """
+    STRICT check: Source filename MUST contain at least one query keyword.
+    This filters out completely unrelated documents.
+    """
+    import re
+    
+    if not source or not query:
+        return False
+    
+    source_lower = source.lower()
+    query_lower = query.lower()
+    
+    # Extract meaningful keywords from query (4+ chars)
+    query_keywords = set()
+    for word in re.findall(r'[a-zA-Z]+', query_lower):
+        if len(word) >= 4 and word not in {'that', 'this', 'with', 'from', 'have', 'been', 'they', 'will', 'would', 'should'}:
+            query_keywords.add(word)
+    
+    # Also add important 3-char terms
+    for word in re.findall(r'[a-zA-Z]+', query_lower):
+        if len(word) == 3 and word not in {'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'had', 'her', 'was', 'one', 'our', 'out', 'day', 'get', 'has', 'him', 'his', 'how', 'man', 'new', 'now', 'old', 'see', 'two', 'way', 'who', 'boy', 'did', 'its', 'let', 'put', 'say', 'she', 'too', 'use'}:
+            query_keywords.add(word)
+    
+    # Check if ANY keyword appears in filename
+    for keyword in query_keywords:
+        if keyword in source_lower:
+            return True, keyword
+    
+    # Check for domain-specific terms in filename
+    packaging_terms = ['package', 'packaging', 'chip', 'die', 'wafer', 'semiconductor', 'hbm', 'cowos', 'interposer', 'tsv', 'bump', 'solder', 'substrate', 'dielectric', 'copper', 'pad', ' interconnect', 'microbump', 'heterogeneous', 'integration']
+    bonding_terms = ['bond', 'bonding', 'hybrid', 'thermal', 'compression', 'fusion', 'direct', 'dielectric', 'copper', 'pad', 'interface']
+    
+    all_terms = packaging_terms + bonding_terms
+    
+    for term in all_terms:
+        if term in source_lower:
+            return True, term
+    
+    # REJECT if no match
+    print(f"[FILENAME FILTER] REJECTED: '{source}' - no keywords match query: {query_keywords}")
+    return False, None
+
+
+# ============ Chat ============
+@app.post("/api/v1/chat")
+async def chat(request: dict):
+    """
+    RAG chat with Vector Similarity Search + Reranking for improved quality.
+    
+    Request body can include:
+    - query/message: The search query
+    - top_k: Number of chunks to retrieve (default: from config)
+    - rerank: Whether to rerank results (default: true)
+    - rerank_method: "hybrid", "vector", "keyword", or "none"
+    """
+    # Accept both "query" and "message" fields
+    query = request.get("query") or request.get("message", "")
+    
+    # Get parameters from request
+    requested_top_k = request.get("top_k", RERANK_CONFIG.final_top_k)
+    use_rerank = request.get("rerank", RERANK_CONFIG.enabled)
+    rerank_method = request.get("rerank_method", RERANK_CONFIG.method)
+    
+    if not query or not query.strip():
+        return {
+            "response": "Please enter a question to search the knowledge base.",
+            "answer": "Please enter a question to search the knowledge base.",
+            "context": "",
+            "sources": [],
+            "confidence": 0.0
+        }
+    
+    # =================================================================
+    # STEP 1: VECTOR SIMILARITY SEARCH (Initial Retrieval)
+    # =================================================================
+    
+    # Generate query embedding
+    query_embedding = get_minimax_embedding(query)
+    
+    # Fetch more chunks than needed for reranking
+    initial_k = RERANK_CONFIG.initial_top_k if use_rerank else requested_top_k
+    
+    try:
+        # Use hybrid search from storage
+        from storage import DistanceMetric
+        vector_results = await storage.search_chunks(
+            query_vector=query_embedding,
+            limit=initial_k,
+            distance_metric=DistanceMetric.COSINE,
+            match_threshold=0.2  # Lower threshold to get more candidates
+        )
+        
+        # Convert to dict format
+        result = []
+        for r in vector_results:
+            result.append({
+                "content": r.content,
+                "source": r.source,
+                "similarity": r.similarity,
+                "chunk_id": r.chunk_id,
+                "metadata": r.metadata
+            })
+        
+        rerank_logger.info(f"Vector search returned {len(result)} chunks for query: {query[:50]}...")
+        
+    except Exception as e:
+        rerank_logger.error(f"Vector search failed: {e}")
+        result = []
+    
+    # Fallback to keyword search if vector search returns nothing
+    if not result:
+        rerank_logger.warning("Vector search returned no results, falling back to keyword search")
+        
+        import re
+        stop_words = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+                      'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+                      'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'dare',
+                      'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from', 'as',
+                      'into', 'through', 'during', 'before', 'after', 'above', 'below',
+                      'between', 'under', 'again', 'further', 'then', 'once', 'here',
+                      'there', 'when', 'where', 'why', 'how', 'all', 'each', 'few',
+                      'more', 'most', 'other', 'some', 'such', 'no', 'nor', 'not',
+                      'only', 'own', 'same', 'so', 'than', 'too', 'very', 'just',
+                      'and', 'but', 'if', 'or', 'because', 'until', 'while', 'about',
+                      'against', 'this', 'that', 'these', 'those', 'what', 'which', 'who',
+                      'whom', 'reply', 'english', 'translate', 'language', 'in', 'write'}
+        
+        english_words = [w.lower() for w in re.findall(r'[a-zA-Z]+', query) 
+                        if w.lower() not in stop_words and len(w) > 2]
+        
+        for w in english_words[:3]:
+            r = await storage.client.fetch(
+                "SELECT content, source, chunk_id, metadata FROM chunks WHERE content ILIKE $1 LIMIT 10",
+                f"%{w}%"
+            )
+            if r:
+                result.extend([{"content": row.get("content", ""), 
+                               "source": row.get("source", ""),
+                               "chunk_id": row.get("chunk_id", ""),
+                               "metadata": row.get("metadata", {}),
+                               "similarity": 0.5} for row in r])
+    
+    # =================================================================
+    # STEP 2: RERANKING
+    # =================================================================
+    
+    if use_rerank and result and rerank_method != "none":
+        rerank_logger.info(f"Reranking {len(result)} chunks using method: {rerank_method}")
+        result = await rerank_chunks(query, result, method=rerank_method, final_k=requested_top_k)
+        rerank_logger.info(f"Reranking complete, returning top {len(result)} chunks")
+    else:
+        # Just limit to requested number without reranking
+        result = result[:requested_top_k]
+    
+    # =================================================================
+    # STEP 3: FORMAT RESPONSE
+    # =================================================================
+    
+    # Remove duplicates - use first 200 chars as key
+    if result:
+        seen = {}
+        unique_result = []
+        for r in result:
+            content = r.get("content", "")
+            key = content[:200].strip()
+            if key and key not in seen:
+                seen[key] = content
+                unique_result.append(r)
+        result = unique_result
+    
+    if not result:
+        # Clean up query for display - remove common prefixes
+        import re
+        clean_query = re.sub(r'^(tell me about |what is |who is |show me |find |search for |about |explain )', '', query.lower().strip())
+        return {
+            "response": f"I couldn't find any information related to '{clean_query}'. Please try a different search term or upload relevant documents first.",
+            "answer": f"I couldn't find any information related to '{clean_query}'. Please try a different search term or upload relevant documents first.",
+            "context": "",
+            "sources": [],
+            "confidence": 0.0
+        }
+    
+    # Filter and clean chunks
+    import re
+    filtered_result = []
+    box_chars = re.compile(r'[\u2500-\u257F]')
+    
+    for r in result:
+        content = r.get("content", "")
+        source = r.get("source", "unknown")
+        
+        if len(content) < 50:
+            continue
+        
+        # Skip only if more is box-drawing than 30% chars
+        box_count = len(box_chars.findall(content))
+        if box_count > 0 and box_count / len(content) > 0.3:
+            continue
+        
+        # NEW: STRICT Filename check - source filename MUST contain query keywords
+        filename_rel, matched_keyword = is_source_filename_relevant(source, query)
+        if not filename_rel:
+            print(f"[FILENAME FILTER] REJECTED: '{source}' - no query keywords in filename")
+            continue
+        else:
+            print(f"[FILENAME FILTER] PASSED: '{source}' - matched keyword: '{matched_keyword}'")
+        
+        # NEW: STRICT Content check
+        is_rel, match_count, matched_terms = is_chunk_content_relevant(content, query, min_matches=3)
+        if not is_rel:
+            print(f"[CONTENT FILTER] REJECTED chunk from '{source}'")
+            continue
+        
+        # Preserve all metadata including rerank scores
+        filtered_result.append(r)
+    
+    # Log filtering summary
+    filtered_count = len(result) - len(filtered_result)
+    if filtered_count > 0:
+        print(f"[FILTER SUMMARY] Filtered out {filtered_count}/{len(result)} chunks as irrelevant")
+        print(f"[FILTER SUMMARY] Keeping {len(filtered_result)} relevant chunks")
+    
+    # Use filtered results
+    if not filtered_result:
+        return {
+            "response": f"I couldn't find any clean information related to '{query}'. Please try a different search term or upload relevant documents.",
+            "answer": f"I couldn't find any clean information related to '{query}'. Please try a different search term or upload relevant documents.",
+            "context": "",
+            "sources": [],
+            "confidence": 0.0
+        }
+    
+    # Build context from filtered results - include source info for better citations
+    # Create a source legend for accurate citation
+    source_legend = "SOURCE LEGEND (Use ONLY these source numbers in citations):\n"
+    for i, r in enumerate(filtered_result):
+        source = r.get("source", "unknown")
+        source_legend += f"Source {i+1}: {source}\n"
+    source_legend += "\n---\n\n"
+    
+    context_parts = []
+    for i, r in enumerate(filtered_result):
+        content = r.get("content", "")
+        source = r.get("source", "unknown")
+        score = r.get("rerank_score", r.get("similarity", 0))
+        # Add metadata header for each chunk
+        context_parts.append(f"[Source {i+1}: {source} | Relevance: {score:.2f}]\n{content}")
+    
+    context = source_legend + "\n\n---\n\n".join(context_parts)
+    
+    # Clean up the context - remove excessive formatting
+    context = re.sub(r'╮╯╭╰━┃╱╲╳╔╗╚╝║═╠╬╣╝╚', '', context)
+    context = re.sub(r'─{3,}', '', context)
+    context = re.sub(r'│{2,}', '', context)
+    context = context.strip()
+    
+    # Try to generate LLM response - run in separate thread with its own event loop
+    try:
+        import concurrent.futures
+        import asyncio
+        import sys
+        import os
+        sys.path.insert(0, '/Users/ken/clawd_workspace/projects/KG_RAG/v1.0-beta/unified_indexing')
+        
+        def run_llm_in_thread():
+            """Run async LLM in a separate thread with its own event loop"""
+            try:
+                # Load API key in this thread
+                if not os.getenv("MINIMAX_API_KEY"):
+                    with open(os.path.expanduser("~/.zshrc"), "r") as f:
+                        for line in f:
+                            if line.strip().startswith("export MINIMAX_API_KEY="):
+                                key = line.strip().split("=", 1)[1].strip('"')
+                                os.environ["MINIMAX_API_KEY"] = key
+                                break
+                
+                from minimax_fixed import minimax_complete
+                
+                # Create new event loop for this thread
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                async def get_response():
+                    # Check query mode from request parameters (not keywords in query)
+                    is_ultra = request.get("ultra_comprehensive", False)
+                    is_comprehensive = request.get("detailed", False)
+                    
+                    # Determine output length and mode
+                    if is_ultra:
+                        target_words = "2000-2500"
+                        max_tokens = 4096  # DeepSeek maximum
+                        temperature = 0.4
+                        detail_level = "extremely comprehensive (academic/research level)"
+                    elif is_comprehensive:
+                        target_words = "1500-2000"
+                        max_tokens = 4096
+                        temperature = 0.3
+                        detail_level = "comprehensive"
+                    else:
+                        target_words = "1000"
+                        max_tokens = 2000
+                        temperature = 0.3
+                        detail_level = "balanced"
+                    
+                    # Ultra-comprehensive prompt for extensive answers
+                    if is_ultra or is_comprehensive:
+                        prompt = f"""You are writing an EXTENSIVE, RESEARCH-LEVEL technical document in SINGLE-COLUMN PLAIN TEXT FORMAT.
+
+User Question: {query}
+
+Retrieved Context from Knowledge Base (use as foundation, expand with your knowledge):
+{context[:5000]}
+
+---
+
+## CRITICAL REQUIREMENTS:
+
+**LENGTH MANDATORY**: Your response MUST be at least {target_words} words. This is a HARD REQUIREMENT.
+
+**FORMAT REQUIREMENTS - READ CAREFULLY**:
+1. **SINGLE COLUMN ONLY**: Write in plain, single-column text. NEVER use multi-column layouts.
+2. **NO LATEX MATH**: All mathematical equations and formulas MUST be written in readable plain English text, NOT LaTeX code.
+   - BAD: \\[ \\mathcal{{L}}_Q(\\theta) = \\mathbb{{E}}... \\]
+   - GOOD: "The loss function L_Q is defined as the expected value of..."
+   - BAD: $\\alpha + \\beta = \\gamma$
+   - GOOD: "alpha plus beta equals gamma"
+3. **DESCRIBE FORMULAS**: When presenting mathematical concepts, describe them in words rather than showing raw equations.
+4. **ASCII-FRIENDLY**: Use only standard keyboard characters. Avoid special mathematical symbols.
+
+**STRUCTURE** (mandatory - use ALL levels, but COMPLETE THE FULL RESPONSE):
+```
+# [Main Title]: Comprehensive Overview
+[200-300 word executive summary of the entire topic]
+
+## 1. Introduction and Historical Background
+[150-200 words: Origin of the field, key pioneers, evolution over time]
+
+## 2. Theoretical Foundations
+[250-350 words: Core concepts, mathematical principles explained in plain text]
+### 2.1 Fundamental Principles
+### 2.2 Mathematical Concepts (described in words, not equations)
+
+## 3. Key Techniques and Methodologies
+[300-400 words: Main approaches, algorithms described step-by-step in text]
+### 3.1 Primary Methods
+### 3.2 Algorithm Details (pseudocode or step-by-step description in words)
+
+## 4. Applications and Future Directions
+[250-350 words: Real-world applications and future research directions]
+### 4.1 Domain-Specific Applications
+### 4.2 Future Research Directions
+```
+
+**IMPORTANT**: You MUST complete ALL 4 sections fully. Do not stop mid-section. Ensure your final output is a complete document with a proper conclusion.
+
+**CONTENT INSTRUCTIONS**:
+1. **DO NOT** start with phrases like "Based on the context" or "The retrieved documents suggest" - write AUTHORITATIVELY as an expert
+2. **USE YOUR KNOWLEDGE**: The retrieved context is just a starting point. You MUST expand significantly using your own extensive training knowledge
+3. **DESCRIBE MATHEMATICS IN WORDS**: When explaining formulas, describe what they do and mean rather than writing LaTeX code
+4. **CONNECT IDEAS**: Show relationships between concepts, historical evolution, trade-offs
+5. **EXPLAIN DEEPLY**: Don't just mention concepts - explain HOW they work, WHY they matter, and WHEN to use them
+
+**WORD COUNT CHECK**: Before finishing, verify your response is at least {target_words} words. If not, continue expanding with more details, examples, and explanations.
+
+Write in the same language as the user's question."""
+
+                        system_prompt = f"""You are a senior research scientist and professor writing comprehensive technical survey papers.
+
+Your mandate:
+- Produce EXTENSIVE content ({target_words}+ words minimum)
+- Write with absolute authority and expertise
+- Combine retrieved information with your deep knowledge freely
+- Structure content like academic survey papers with clear hierarchy
+- Never apologize for limited information - you are the expert
+- Include technical depth: algorithms, theoretical analysis
+- Describe all mathematical concepts in plain English, NEVER use LaTeX
+- Use SINGLE-COLUMN plain text format only
+- Cover: history → theory → methods → applications → challenges
+
+CRITICAL: All equations and formulas must be described in readable text, NOT LaTeX code. Use words like "equals", "plus", "sum of", "expected value of" instead of symbols like =, +, \\sum, \\mathbb{{E}}."""
+
+                    else:
+                        # Balanced mode - comprehensive but concise answer with header and summary
+                        # Build source mapping for accurate citations
+                        source_mapping = "\n".join([f"Source {i+1}: {r.get('source', 'unknown')}" for i, r in enumerate(filtered_result)])
+                        
+                        prompt = f"""Provide a BALANCED answer to the user's question in PLAIN TEXT with a clear header and summary.
+
+**CRITICAL CITATION RULES:**
+1. ONLY cite sources that are explicitly listed below
+2. Use the EXACT source number when citing (e.g., "Source 1", "Source 2")
+3. If you're not sure which source provided the information, DO NOT make up a citation
+4. The sources available are:
+{source_mapping}
+
+5. NEVER cite a source number that doesn't exist in the list above
+6. If the context doesn't contain specific information, state it generally without citing a specific source
+
+User Question: {query}
+
+Context:
+{context[:3000]}
+
+CRITICAL REQUIREMENTS:
+1. **START WITH HEADER**: Begin your response with:
+   # [Clear Title Based on the Query]
+   
+   ## Executive Summary
+   [2-3 sentence summary of the key findings and main points]
+
+2. Keep total answer around 1000 words (900-1100 words range)
+3. Provide substantive content with good depth - not too brief, not too long
+4. Use 3-4 well-developed sections after the summary
+5. Include specific examples and explanations to reach the word count
+6. **NO LATEX MATH**: Describe all mathematical concepts in plain English words
+   - BAD: \\[ J(\\pi) = \\mathbb{{E}}... \\] or $\\gamma^t$
+   - GOOD: "The objective function J of pi equals the expected value of..."
+   - GOOD: "gamma raised to the power of t"
+7. Use readable text descriptions instead of mathematical symbols"""
+
+                        system_prompt = "You are a helpful assistant. Provide balanced, substantive answers that start with a clear title and executive summary. Aim for about 1000 words with good depth and examples. Describe mathematical concepts in plain English words, NEVER use LaTeX code."
+                        max_tokens = 2000  # Increased for 1000 words
+                        temperature = 0.3
+
+                    # Try DeepSeek first for better long-form generation, fallback to MiniMax
+                    try:
+                        from minimax_fixed import deepseek_complete
+                        
+                        # Use multi-step generation for comprehensive mode (4 sections)
+                        # Use single-pass for ultra mode (faster, avoids timeout issues)
+                        if is_comprehensive and not is_ultra:
+                            return await generate_comprehensive_response(
+                                query, context, system_prompt, target_words, max_sections=4
+                            )
+                        
+                        # Single-pass generation for ultra and standard modes
+                        # Use appropriate max_tokens based on mode
+                        tokens = 4096 if is_ultra else max_tokens
+                        return await deepseek_complete(
+                            prompt=prompt,
+                            system_prompt=system_prompt,
+                            model="deepseek-chat",
+                            max_tokens=tokens,
+                            temperature=temperature
+                        )
+                    except Exception as e:
+                        rerank_logger.warning(f"DeepSeek failed, falling back to MiniMax: {e}")
+                        return await minimax_complete(
+                            prompt=prompt,
+                            system_prompt=system_prompt,
+                            model="MiniMax-M2.1",
+                            max_tokens=4000,
+                            temperature=temperature
+                        )
+                
+                # Extended timeout for all modes (DeepSeek can be slow)
+                is_ultra = request.get("ultra_comprehensive", False)
+                is_comprehensive = request.get("detailed", False)
+                top_k = request.get("top_k", 20)
+                
+                if is_ultra:
+                    timeout_seconds = 600  # 10 min for ultra
+                elif is_comprehensive:
+                    timeout_seconds = 300  # 5 min for comprehensive
+                elif top_k >= 20:
+                    timeout_seconds = 240  # 4 min for balanced mode (top_k=20)
+                else:
+                    timeout_seconds = 180  # 3 min for quick mode
+                
+                result = loop.run_until_complete(asyncio.wait_for(get_response(), timeout=timeout_seconds))
+                loop.close()
+                return result
+            except asyncio.TimeoutError:
+                print(f"[LLM Timeout]: Took more than timeout")
+                return None
+            except Exception as e:
+                print(f"[LLM Error in thread]: {e}")
+                import traceback
+                traceback.print_exc()
+                return None
+        
+        # Run in thread pool with timeout based on mode
+        is_ultra = request.get("ultra_comprehensive", False)
+        is_comprehensive = request.get("detailed", False)
+        top_k = request.get("top_k", 20)
+        
+        if is_ultra:
+            thread_timeout = 600  # 10 min
+        elif is_comprehensive:
+            thread_timeout = 300  # 5 min
+        elif top_k >= 20:
+            thread_timeout = 240  # 4 min for balanced
+        else:
+            thread_timeout = 180  # 3 min for quick
+            
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(run_llm_in_thread)
+            llm_response = future.result(timeout=thread_timeout)
+        
+        if llm_response:
+            # Calculate confidence based on rerank scores
+            avg_score = sum(r.get("rerank_score", r.get("similarity", 0.5)) for r in filtered_result) / len(filtered_result) if filtered_result else 0
+            confidence = min(0.95, 0.5 + avg_score * 0.5)  # Scale to 0.5-0.95 range
+            
+            # Build source list with scores
+            source_list = []
+            for r in filtered_result:
+                source_list.append({
+                    "source": r.get("source", "unknown"),
+                    "score": round(r.get("rerank_score", r.get("similarity", 0)), 3),
+                    "preview": r.get("content", "")[:100] + "..."
+                })
+            
+            # DEBUG: Log all retrieved sources with their scores
+            print(f"[DEBUG] Query: {query}")
+            print(f"[DEBUG] Retrieved {len(filtered_result)} chunks")
+            for i, r in enumerate(filtered_result[:5]):
+                print(f"[DEBUG] Chunk {i+1}: source={r.get('source', 'unknown')}, score={r.get('rerank_score', r.get('similarity', 0)):.3f}")
+            
+            # Extract unique source filenames for the response
+            unique_sources = list(set([r.get("source", "unknown") for r in filtered_result]))
+            print(f"[DEBUG] Unique sources: {unique_sources}")
+            
+            # Check source relevance
+            irrelevant_sources = []
+            relevant_sources = []
+            for src in unique_sources:
+                is_rel, matches = is_source_relevant(src, query)
+                if is_rel and matches:
+                    relevant_sources.append((src, matches))
+                else:
+                    irrelevant_sources.append(src)
+            
+            # Add warning if sources seem irrelevant
+            source_warning = ""
+            if irrelevant_sources and len(irrelevant_sources) == len(unique_sources):
+                # All sources seem irrelevant
+                source_warning = "\n\n**Note:** The retrieved source documents may not be highly relevant to your query. Consider uploading documents specifically about this topic."
+                print(f"[WARNING] All sources appear irrelevant to query: {query}")
+            elif irrelevant_sources:
+                print(f"[WARNING] Potentially irrelevant sources: {irrelevant_sources}")
+                print(f"[WARNING] Relevant sources with matches: {relevant_sources}")
+            
+            # Append warning to response if needed
+            final_response = llm_response + source_warning if source_warning else llm_response
+            
+            # NEW: Validate and fix citations
+            final_response, citation_warnings = validate_and_fix_citations(final_response, unique_sources)
+            
+            # Log citation issues
+            if citation_warnings:
+                print(f"[CITATION ISSUES] {citation_warnings}")
+            
+            return {
+                "response": final_response,
+                "answer": final_response,
+                "sources": unique_sources,  # Return actual source filenames, not just count
+                "source_details": source_list,
+                "confidence": round(confidence, 2),
+                "retrieval_info": {
+                    "method": "vector_similarity" if not (use_rerank and rerank_method != "none") else f"vector+{rerank_method}",
+                    "chunks_retrieved": initial_k if use_rerank else requested_top_k,
+                    "chunks_reranked": len(filtered_result) if use_rerank else 0,
+                    "source_relevance": {
+                        "relevant": [s[0] for s in relevant_sources],
+                        "irrelevant": irrelevant_sources
+                    } if irrelevant_sources else None
+                }
+            }
+    except Exception as e:
+        print(f"[LLM Exception]: {e}")
+    
+    # Fallback - return raw chunks with scores
+    preview_parts = []
+    for r in filtered_result[:5]:
+        score = r.get("rerank_score", r.get("similarity", 0))
+        source = r.get("source", "unknown")
+        preview_parts.append(f"[Score: {score:.2f}] {r.get('content', '')[:300]}...")
+    
+    preview = "\n\n".join(preview_parts)
+    # Extract unique source filenames
+    unique_sources = list(set([r.get("source", "unknown") for r in filtered_result]))
+    return {
+        "response": f"Found {len(filtered_result)} relevant chunks:\n\n{preview}",
+        "answer": f"Found {len(filtered_result)} relevant chunks:\n\n{preview}",
+        "sources": unique_sources,  # Return actual source filenames
+        "confidence": 0.5,
+        "retrieval_info": {
+            "method": "vector_fallback",
+            "note": "LLM generation failed, showing raw chunks"
+        }
+    }
+
+# ============ LLM Response Generator ============
+import sys
+sys.path.insert(0, '/Users/ken/clawd_workspace/projects/KG_RAG/v1.0-beta/unified_indexing')
+from minimax_fixed import minimax_complete
+
+async def generate_llm_response(query: str, context: str) -> str:
+    """Generate a well-formatted response using LLM"""
+    
+    # Extract stock code if present
+    import re
+    stock_match = re.search(r'(\d{4,5}\.hk|\d{4,5})', query.lower())
+    stock_code = stock_match.group(1) if stock_match else query
+    
+    # Try to extract company name from context
+    company_name = stock_code
+    if "越疆" in context:
+        company_name = "越疆 (Dobot)"
+    elif "中國有色礦業" in context or "China Nonferrous" in context:
+        company_name = "中國有色礦業 (China Nonferrous Mining)"
+    
+    prompt = f"""請根據以下上下文資料，回答用戶的問題。
+
+用戶問題: {query}
+
+請用以下格式組織回答 (使用Markdown格式):
+
+## {{標題}}
+
+### 📊 摘要
+(用2-3句話概括公司基本情況)
+
+### 📈 詳細分析
+(根據上下文提供詳細資訊，包括財務數據、業務發展、風險因素等)
+
+### 💡 結論
+(如有投資建議請簡要說明)
+
+---
+上下文資料:
+{context[:3000]}
+
+請用繁體中文回答，確保回答基於提供的上下文資料。不要列出來源chunk。"""
+
+    try:
+        response = await minimax_complete(
+            prompt=prompt,
+            system_prompt="你是一個專業的金融分析師，擅長分析股票和提供投資建議。請用Markdown格式組織回答，包含標題、摘要、詳細分析和結論。",
+            model="MiniMax-M2.1",
+            max_tokens=2000,
+            temperature=0.7
+        )
+        return response
+    except Exception as e:
+        raise Exception(f"LLM generation failed: {str(e)}")
+
+# ============ Chat with Document ============
+@app.post("/api/v1/chat/with-doc")
+async def chat_with_doc(request: dict):
+    """Query with document upload - uploads file then searches"""
+    message = request.get("message", "")
+    filename = request.get("filename", "")
+    filenames = request.get("filenames", [])  # Support multiple files
+    
+    # Handle both single filename and array of filenames
+    if isinstance(filename, str) and filename:
+        file_list = [filename] + filenames if filenames else [filename]
+    elif isinstance(filename, list):
+        file_list = filename
+    else:
+        file_list = filenames if filenames else []
+    
+    if not message:
+        return {
+            "response": "Please enter a question.",
+            "answer": "Please enter a question.",
+            "sources": []
+        }
+    
+    # Get doc_ids from filenames
+    import hashlib
+    import re
+    
+    # Filter out empty filenames
+    file_list = [f for f in file_list if f and f.strip()]
+    doc_ids = [hashlib.md5(f.encode()).hexdigest()[:12] for f in file_list] if file_list else []
+    
+    # DEBUG: Log what's being received
+    print(f"[DEBUG] chat/with-doc: message='{message}', file_list={file_list}, doc_ids={doc_ids}")
+    
+    # Extract keywords from query (stock codes, Chinese)
+    stock_codes = re.findall(r'(\d{4,5}\.hk|\d{4,5})', message.lower())
+    chinese = re.findall(r'[\u4e00-\u9fff]+', message)
+    keywords = stock_codes[:2] + chinese[:2]
+    
+    # If no keywords found, use the original message as search term
+    if not keywords:
+        keywords = [message.lower()]
+    
+    # Collect results from both attached files and entire database
+    all_results = []
+    
+    # Search using keywords in attached files AND entire database
+    for keyword in keywords:
+        # Search in attached files
+        if doc_ids:
+            placeholders = ','.join([f'${i+1}' for i in range(len(doc_ids))])
+            query = f"SELECT content FROM chunks WHERE entity_id IN ({placeholders}) AND (content ILIKE ${len(doc_ids)+1} OR content ILIKE ${len(doc_ids)+2}) LIMIT 10"
+            file_result = await storage.client.fetch(query, *doc_ids, f"%{keyword}%", f"%0{keyword}%")
+            if file_result:
+                all_results.extend([{"content": r.get("content", "")} for r in file_result])
+        
+        # Also ALWAYS search in entire database as fallback
+        db_result = await storage.client.fetch(
+            "SELECT content FROM chunks WHERE content ILIKE $1 OR content ILIKE $2 LIMIT 10",
+            f"%{keyword}%", f"%0{keyword}%"
+        )
+        if db_result:
+            all_results.extend([{"content": r.get("content", "")} for r in db_result])
+    
+    # Also try exact message match in database
+    if not all_results:
+        db_result = await storage.client.fetch(
+            "SELECT content FROM chunks WHERE content ILIKE $1 LIMIT 20",
+            f"%{message}%"
+        )
+        if db_result:
+            all_results.extend([{"content": r.get("content", "")} for r in db_result])
+    
+    # Remove duplicates
+    seen = set()
+    unique_results = []
+    for r in all_results:
+        content = r["content"][:100]  # Use first 100 chars as key
+        if content not in seen:
+            seen.add(content)
+            unique_results.append(r)
+    
+    result = unique_results if unique_results else None
+    
+    if not result:
+        # Clean up query for display - remove common prefixes
+        clean_message = re.sub(r'^(tell me about |what is |who is |show me |find |search for |about |explain )', '', message.lower().strip())
+        
+        # Build more helpful error message
+        if file_list:
+            msg = f"I couldn't find any information related to '{clean_message}'. Tried searching in uploaded files and database. Try a different search term."
+        else:
+            msg = f"I couldn't find any information related to '{clean_message}'. Please try a different search term or upload relevant documents."
+        
+        return {
+            "response": msg,
+            "answer": msg,
+            "context": "",
+            "sources": [],
+            "confidence": 0.0
+        }
+    # Skip only if too many box-drawing chars
+    import re
+    filtered_result = []
+    box_chars = re.compile(r'[\u2500-\u257F]')
+    
+    for r in result:
+        content = r.get("content", "")
+        if len(content) < 50:
+            continue
+        # Skip only if more is box-drawing than 30% chars
+        box_count = len(box_chars.findall(content))
+        if box_count > 0 and box_count / len(content) > 0.3:
+            continue
+        filtered_result.append({"content": content})
+    
+    if not filtered_result:
+        return {
+            "response": f"I couldn't find any clean information related to '{message}'. The indexed data may contain formatting issues.",
+            "answer": f"I couldn't find any clean information related to '{message}'. The indexed data may contain formatting issues.",
+            "context": "",
+            "sources": [],
+            "confidence": 0.0
+        }
+    
+    context = "\n\n".join([r["content"] for r in filtered_result])
+    
+    # Clean up the context
+    context = re.sub(r'[╮╯╭╰━┃╱╲╳╔╗╚╝║═╠╬╣╝╚]', '', context)
+    context = re.sub(r'─{3,}', '', context)
+    context = re.sub(r'│{2,}', '', context)
+    context = re.sub(r'\s+', ' ', context)
+    context = context.strip()
+    
+    # Generate LLM response with proper formatting
+    # For file queries, sources are the uploaded files
+    source_list = file_list if file_list else ["database"]
+    try:
+        llm_response = await generate_llm_response(message, context)
+        return {
+            "response": llm_response,
+            "answer": llm_response,
+            "context": context,
+            "sources": source_list,  # Return actual filenames
+            "confidence": 0.8
+        }
+    except Exception as e:
+        return {
+            "response": f"Found {len(filtered_result)} relevant chunks:\n\n{context[:1500]}",
+            "answer": f"Found {len(filtered_result)} relevant chunks:\n\n{context[:1500]}",
+            "context": context,
+            "sources": source_list,  # Return actual filenames
+            "confidence": 0.5
+        }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8002)

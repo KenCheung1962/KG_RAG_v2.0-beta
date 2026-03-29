@@ -1,0 +1,14 @@
+{
+  "timestamp": "2026-03-13T20:08:04.651Z",
+  "stats": {
+    "entities": 45578,
+    "relationships": 115308,
+    "chunks": 368407,
+    "documents": 1970
+  },
+  "exports": {
+    "entities": 10000,
+    "relationships": 50000,
+    "chunks": 10000
+  }
+}

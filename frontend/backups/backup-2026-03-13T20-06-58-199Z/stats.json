@@ -1,0 +1,16 @@
+{
+  "counts": {
+    "entities": 45578,
+    "relationships": 115308,
+    "chunks": 368407,
+    "documents": 1970
+  },
+  "sizes": {
+    "chunks": 1088757760,
+    "entities": 36298752,
+    "relationships": 50872320
+  },
+  "totalSize": 1184373783,
+  "totalSizeFormatted": "1.1 GB",
+  "timestamp": "2026-03-13T20:06:58.676Z"
+}

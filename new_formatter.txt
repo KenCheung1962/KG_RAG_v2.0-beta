@@ -1,0 +1,151 @@
+export function formatQueryResponse(text: string): string {
+  if (!text) return '';
+
+  const originalText = text;
+  let cleaned = text;
+
+  // STEP 1: Remove malformed LLM ##References with Source X:
+  cleaned = cleaned.replace(
+    /##\s*References\s*\n?\d*\s*Source\s+\d+:[\s\S]*?(?=\n##|\nSources:|Sources:|$)/gi,
+    ''
+  );
+
+  // STEP 2: Fix period at start of paragraphs
+  cleaned = cleaned.replace(/([a-zA-Z])\n\s*\.\s+/g, '$1. ');
+  cleaned = cleaned.replace(/\n\.\s+/g, '\n');
+
+  // STEP 3: Remove disclaimers and noise
+  cleaned = cleaned.replace(/Note on Context[\s\S]*?I will answer[^.]*\./gi, '');
+  cleaned = cleaned.replace(/Context Note[\s\S]*?general knowledge[^.]*\./gi, '');
+  cleaned = cleaned.replace(/The provided context discusses[\s\S]*?unrelated to[\s\S]*?\./gi, '');
+  cleaned = cleaned.replace(/I will answer your question based on (?:general |my )?knowledge[^.]*\./gi, '');
+  cleaned = cleaned.replace(/Based on (?:general |my )?knowledge,?[^.]*\./gi, '');
+  cleaned = cleaned.replace(/\(Remove this[^)]*\)/gi, '');
+  cleaned = cleaned.replace(/\[Remove this[^\]]*\]/gi, '');
+
+  const disclaimersToRemove = [
+    /I couldn't find any information[^.]*\./gi,
+    /Please try a different search term[^.]*\./gi,
+    /The indexed data may contain formatting issues[^.]*\./gi,
+    /Note: This response is based on[^.]*\./gi,
+    /Disclaimer:[^.]*\./gi,
+    /I apologize, but[^.]*\./gi,
+    /I don't see any information[^.]*\./gi,
+    /There is no information[^.]*\./gi,
+    /The context provided (?:does not|doesn't) (?:contain|have|discuss)[^.]*\./gi,
+  ];
+  disclaimersToRemove.forEach(pattern => {
+    cleaned = cleaned.replace(pattern, '');
+  });
+
+  // STEP 4: Store Sources section
+  let sourcesSection = '';
+  const sourcesMatch = cleaned.match(/Sources:([\s\S]*)$/i);
+  if (sourcesMatch) {
+    sourcesSection = sourcesMatch[1].trim();
+  }
+  cleaned = cleaned.replace(/Sources:[\s\S]*$/i, '');
+
+  // STEP 5: Extract references from original
+  const references: string[] = [];
+  const refPattern = /(?:Source\s*(\d+):|(\d+)\.\s+)([^\n]+?\.(?:txt|pdf|docx?|md|json|csv))/gi;
+  let match;
+  while ((match = refPattern.exec(originalText)) !== null) {
+    const num = match[1] || match[2];
+    const filename = match[3].trim();
+    if (num && filename && !references.includes(filename)) {
+      references[parseInt(num) - 1] = filename;
+    }
+  }
+
+  // STEP 6: Pre-process headings
+  cleaned = cleaned.replace(/^(#+)([A-Za-z])/gm, '$1 $2');
+  cleaned = cleaned.replace(/^(#+)([A-Za-z]+)\s*(\d+)\s+/gm, '$1 $2 $3 ');
+  cleaned = cleaned.replace(/^(#{1,6})([A-Z][a-z]+)([A-Z])/gm, '$1 $2$3');
+
+  // STEP 7: Separate headings from content
+  cleaned = cleaned.replace(/([.!?])(#{1,6}\s)/g, '$1\n$2');
+  cleaned = cleaned.replace(/([a-z])(#{1,6}\s)/gi, '$1\n$2');
+
+  // STEP 8: Convert headings to EXACT FORMAT
+  // H1 = Title (Cyan, max 6 words)
+  // H2 = Executive Summary/Subtitles (Green, max 8 words)
+  cleaned = cleaned.replace(/^(#{1,6})\s+(.+?)$/gm, (match, hashes, content) => {
+    const level = hashes.length;
+    let cleanContent = content.trim();
+    
+    // Skip References headers
+    if (/^References?$/i.test(cleanContent)) return '';
+    if (cleanContent.length < 2) return '';
+    
+    // Word limits based on level
+    const words = cleanContent.split(/\s+/);
+    let maxWords = 10;
+    let className = 'answer-h2'; // Default green
+    
+    if (level === 1) {
+      maxWords = 6;
+      className = 'answer-h1'; // Title - Cyan
+    } else if (level === 2) {
+      maxWords = 8;
+      className = 'answer-h2'; // Subtitle - Green
+    } else {
+      maxWords = 10;
+      className = 'answer-h2'; // H3+ also green
+    }
+    
+    if (words.length > maxWords) {
+      cleanContent = words.slice(0, maxWords).join(' ') + '...';
+    }
+    
+    return `<${className} class="${className}">${cleanContent}</${className}>`;
+  });
+
+  // STEP 9: Format content
+  cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
+  
+  // Add spacing after headings
+  cleaned = cleaned.replace(/(<\/answer-h[12]>)([A-Z])/g, '$1<br><br>$2');
+  
+  // Remove period at start
+  cleaned = cleaned.replace(/<br>\s*\.\s+/gi, '<br>');
+  cleaned = cleaned.replace(/<br><br>\s*\.\s+/gi, '<br><br>');
+  
+  // Format bold and italic
+  cleaned = cleaned.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  cleaned = cleaned.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+  
+  // Format citations [1], [2], etc.
+  cleaned = cleaned.replace(/\[(\d+)\]/g, '<span class="citation-ref">[$1]</span>');
+  
+  // Convert newlines
+  cleaned = cleaned.replace(/\n/g, '<br>');
+  cleaned = cleaned.replace(/(<br>){4,}/g, '<br><br><br>');
+
+  // STEP 10: Add 📚 References section (Green)
+  const uniqueRefs = references.filter(r => r && r.length > 3);
+  
+  if (uniqueRefs.length > 0) {
+    cleaned += '<br><br><div class="references-section"><div class="references-header">📚 References</div>';
+    
+    uniqueRefs.forEach((ref, index) => {
+      cleaned += `<div class="reference-item"><span class="ref-number">${index + 1}.</span> ${ref}</div>`;
+    });
+    
+    cleaned += '</div>';
+  }
+
+  // STEP 11: Add 🔍 Sources section (Orange)
+  if (sourcesSection) {
+    cleaned += '<br><br><div class="sources-section"><div class="sources-header">🔍 Sources (for Verification)</div>';
+    cleaned += '<div class="sources-list">';
+    
+    sourcesSection.split(/\n/).forEach(line => {
+      if (line.trim()) cleaned += `<div class="source-item">${line.trim()}</div>`;
+    });
+    
+    cleaned += '</div></div>';
+  }
+
+  return cleaned;
+}

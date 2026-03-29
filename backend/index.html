@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <title>LightRAG Knowledge Graph</title>
+    <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+    <div class="header">
+        <h1>🧠 LightRAG Knowledge Graph</h1>
+        <p style="font-size: 12px; margin-top: 5px; color: #aaa;">
+            💡 If queries fail, try refreshing the page (F5) or check browser console (F12) for errors.
+        </p>
+    </div>
+    
+    <!-- Stats Dashboard -->
+    <div class="card">
+        <h2>📊 Knowledge Graph Stats</h2>
+        <div class="stats-grid">
+            <div class="stat-box">
+                <div class="stat-number" id="docs">0</div>
+                <div class="stat-label">Documents</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-number" id="entities">0</div>
+                <div class="stat-label">Entities</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-number" id="relations">0</div>
+                <div class="stat-label">Relationships</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-number" id="chunks">0</div>
+                <div class="stat-label">Chunks</div>
+            </div>
+        </div>
+        <button onclick="fetchStats()">🔄 Refresh Stats</button>
+    </div>
+    
+    <!-- Tabs -->
+    <div class="tabs">
+        <button class="tab active" onclick="showTab('ingest', event)">📥 Ingest</button>
+        <button class="tab" onclick="showTab('query', event)">🔍 Query</button>
+        <button class="tab" onclick="showTab('queryfile', event)">🔗 Query+File</button>
+        <button class="tab" onclick="showTab('config', event)">⚙️ Config</button>
+    </div>
+    
+    <!-- INGEST TAB -->
+    <div id="ingest" class="tab-content card active">
+        <h2>📥 Ingest Documents</h2>
+        
+        <div class="method-toggle">
+            <button class="active" id="btnMethodFiles" onclick="setMethod('files')">📄 Upload Files</button>
+            <button class="inactive" id="btnMethodFolder" onclick="setMethod('folder')">📂 Select Folder</button>
+        </div>
+        
+        <!-- Files Method -->
+        <div id="methodFiles">
+            <h3>📄 Upload Files</h3>
+            <input type="file" id="fileInput" multiple accept=".txt,.md,.pdf,.doc,.docx,.csv,.json,.html,.xml" onchange="handleFileSelect()">
+            <div id="selectedFiles" class="file-list" style="display: none;">
+                <strong>Selected files:</strong>
+                <div id="fileCount"></div>
+            </div>
+            <button onclick="ingestFiles()" id="ingestFilesBtn">📥 Ingest Files</button>
+            <button onclick="clearAllFiles()" class="danger">🗑️ Clear All</button>
+        </div>
+        
+        <!-- Folder Method -->
+        <div id="methodFolder" style="display: none;">
+            <h3>📂 Select Folder</h3>
+            <div class="folder-input-wrapper">
+                <input type="text" id="folderPath" placeholder="Select or enter folder path...">
+                <button class="folder-btn" onclick="document.getElementById('folderInput').click()">📂 Browse</button>
+                <input type="file" id="folderInput" webkitdirectory style="display: none;" onchange="handleFolderSelect()">
+            </div>
+            
+            <div id="folderFiles" class="file-list" style="display: none;">
+                <strong>Files to ingest:</strong>
+                <div id="folderFileCount"></div>
+            </div>
+            
+            <div class="checkbox-wrapper">
+                <input type="checkbox" id="recursive" checked>
+                <label for="recursive">Scan subfolders recursively</label>
+            </div>
+            
+            <button onclick="ingestFolder()" id="ingestFolderBtn">📥 Ingest Folder</button>
+        </div>
+        
+        <div id="ingestProgress" style="display: none;">
+            <div class="progress-bar"><div class="progress-fill" id="progressFill" style="width: 0%"></div></div>
+            <div id="ingestStatus"></div>
+        </div>
+    </div>
+    
+    <!-- QUERY TAB -->
+    <div id="query" class="tab-content card">
+        <h2>🔍 Query Knowledge Graph</h2>
+        
+        <h3>Query Mode</h3>
+        <div class="radio-group">
+            <label class="radio-option"><input type="radio" name="queryMode" value="hybrid" checked> Hybrid</label>
+            <label class="radio-option"><input type="radio" name="queryMode" value="local"> Local</label>
+            <label class="radio-option"><input type="radio" name="queryMode" value="global"> Global</label>
+        </div>
+        
+        <textarea id="queryText" placeholder="Ask a question about your knowledge graph...&#10;Example: What do you know about Alibaba?&#10;&#10;Tip: For complex queries, the AI may time out after 25 seconds.&#10;Try simpler, more specific questions for better results." rows="6"></textarea>
+        
+        <button onclick="runQuery()">🔍 Ask Question</button>
+        
+        <div id="queryResult" style="display: none;">
+            <h3>Answer:</h3>
+            <div id="answerText" class="result-box"></div>
+            
+            <h3>Sources:</h3>
+            <div id="sourcesText" class="sources-box"></div>
+        </div>
+        
+        <h3>Test Queries</h3>
+        <button onclick="testQuery('What companies are mentioned?')">Companies</button>
+        <button onclick="testQuery('What relationships exist?')">Relationships</button>
+        <button onclick="testQuery('Give me an overview')">Overview</button>
+    </div>
+    
+    <!-- QUERY+FILE TAB -->
+    <div id="queryfile" class="tab-content card">
+        <h2>🔗 Query with File(s)</h2>
+        
+        <h3>Upload Document(s)</h3>
+        <input type="file" id="queryFileInput" accept=".txt,.md,.pdf,.doc,.docx" multiple onchange="handleQueryFileSelect()">
+        <p style="font-size: 0.9em; color: #666;">You can select multiple files (Ctrl+Click or Cmd+Click to select multiple)</p>
+        
+        <div id="querySelectedFiles" class="file-list" style="display: none;">
+            <strong>Selected files:</strong>
+            <div id="queryFileCount"></div>
+        </div>
+        
+        <h3>Question</h3>
+        <textarea id="queryFileText" placeholder="Ask a question about the uploaded file and knowledge graph..." rows="3"></textarea>
+        
+        <button onclick="runQueryWithFile()">🔍 Query with File</button>
+        
+        <div id="queryFileResult" style="display: none;">
+            <h3>Answer:</h3>
+            <div id="queryFileAnswer" class="result-box"></div>
+        </div>
+    </div>
+    
+    <!-- CONFIG TAB -->
+    <div id="config" class="tab-content card">
+        <h2>⚙️ Configuration</h2>
+        <p><strong>API URL:</strong> <span id="apiUrl">http://localhost:8002</span></p>
+        
+        <button onclick="testConnection()">🔍 Test Connection</button>
+        <button onclick="refreshConnection()">🔄 Refresh Connection</button>
+        <div id="configStatus"></div>
+        
+        <h3 style="margin-top: 30px;">📊 System Information</h3>
+        <div id="systemInfo" class="result-box" style="display: none;"></div>
+        
+        <h3 style="margin-top: 30px;">🗑️ Database Management</h3>
+        <button onclick="clearDatabase()" class="danger">🗑️ Clear All Data</button>
+        <div id="clearStatus"></div>
+    </div>
+
+    <!-- Scripts - Load in dependency order -->
+    <script src="js/config.js"></script>
+    <script src="js/utils.js"></script>
+    <script src="js/api.js"></script>
+    <script src="js/upload.js"></script>
+    <script src="js/query.js"></script>
+    <script src="js/config-ui.js"></script>
+    <script src="js/main.js"></script>
+</body>
+</html>
