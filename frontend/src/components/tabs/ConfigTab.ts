@@ -118,8 +118,9 @@ function handleShowSystemInfo(): void {
     },
     'KG RAG Process Endpoints': {
       'pgvector API': 'http://localhost:8002',
-      'Database': 'PostgreSQL with pgvector extension',
-      'Connection Pool': 'PgBouncer (localhost:5432)'
+      'Database': 'PostgreSQL + pgvector (Docker)',
+      'Database Port': 'localhost:5432',
+      'Connection Pool': 'Application-level pooling'
     },
     'Embedding Models': {
       'Embeddings (File Upload)': 'Ollama nomic-embed-text (768d)',
