@@ -38,7 +38,7 @@ lsof -i :8002
 # Should return nothing
 
 # 3. Start updated backend
-cd /Users/ken/clawd_workspace/projects/KG_RAG/v1.2-beta/backend
+cd /Users/ken/clawd_workspace/projects/KG_RAG/v2.0-beta/backend
 python pgvector_api.py
 ```
 

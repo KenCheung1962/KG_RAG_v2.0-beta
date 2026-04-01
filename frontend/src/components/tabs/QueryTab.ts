@@ -525,7 +525,7 @@ function setTestQuery(query: string): void {
  */
 function getQueryMode(): QueryMode {
   const radio = document.querySelector('input[name="queryMode"]:checked') as HTMLInputElement;
-  return (radio?.value as QueryMode) || 'semantic';
+  return (radio?.value as QueryMode) || 'smart';
 }
 
 /**
@@ -636,9 +636,9 @@ async function handleRunQuery(): Promise<void> {
   // Set timeout based on mode - MUST match client.ts timeouts
   let timeoutMs: number;
   if (isUltra) {
-    timeoutMs = 900000;  // 15 min for ultra (multi-step: outline + 5 sections + conclusion)
+    timeoutMs = 900000;  // 15 min for ultra (multi-step: outline + 6+ sections + conclusion)
   } else if (detail.detailed) {
-    timeoutMs = 600000;  // 10 min for comprehensive (multi-step: outline + 4 sections + conclusion)
+    timeoutMs = 600000;  // 10 min for comprehensive (multi-step: outline + 5 sections + conclusion)
   } else {
     timeoutMs = 300000;  // 5 min for quick/balanced (single-pass)
   }
@@ -1175,13 +1175,16 @@ export function getQueryTabHTML(): string {
       
       <h3 id="queryModeLabel">Query Mode</h3>
       <div class="radio-group" role="radiogroup" aria-labelledby="queryModeLabel">
-        <label class="radio-option" title="Semantic similarity search with keyword fallback">
-          <input type="radio" name="queryMode" value="semantic" checked> Semantic
+        <label class="radio-option" title="Smart unified search: combines semantic, keyword, entity, and relationship embeddings (Recommended)">
+          <input type="radio" name="queryMode" value="smart" checked> Smart
         </label>
-        <label class="radio-option" title="Entity-focused search">
+        <label class="radio-option" title="Semantic hybrid search: vector similarity + keyword matching + relationship enhancement">
+          <input type="radio" name="queryMode" value="semantic"> Semantic
+        </label>
+        <label class="radio-option" title="Entity-focused search with relationship expansion">
           <input type="radio" name="queryMode" value="entity-lookup"> Entity-lookup
         </label>
-        <label class="radio-option" title="Knowledge graph relationship traversal">
+        <label class="radio-option" title="Knowledge graph relationship traversal with embedding enhancement">
           <input type="radio" name="queryMode" value="graph-traversal"> Graph-traversal
         </label>
       </div>

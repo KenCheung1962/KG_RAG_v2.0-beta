@@ -7,7 +7,7 @@ import sys
 import time
 from datetime import datetime
 
-sys.path.insert(0, '/Users/ken/clawd_workspace/projects/KG_RAG/proj_ph2/source/postgres')
+# Using local storage.py
 
 import asyncpg
 import httpx

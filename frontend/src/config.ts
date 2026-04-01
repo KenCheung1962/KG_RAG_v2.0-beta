@@ -17,9 +17,10 @@ export const FEATURES = {
   enableDuplicateDetection: true,
 } as const;
 
-// Query modes (display names: Semantic, Entity-lookup, Graph-traversal)
-export type QueryMode = 'semantic' | 'entity-lookup' | 'graph-traversal';
-export const QUERY_MODES: QueryMode[] = ['semantic', 'entity-lookup', 'graph-traversal'];
+// Query modes (display names: Smart, Semantic, Entity-lookup, Graph-traversal)
+// Backend mapping: semantic -> semantic-hybrid for enhanced keyword + relationship search
+export type QueryMode = 'smart' | 'semantic' | 'entity-lookup' | 'graph-traversal';
+export const QUERY_MODES: QueryMode[] = ['smart', 'semantic', 'entity-lookup', 'graph-traversal'];
 
 // File types
 export const SUPPORTED_FILE_TYPES = [

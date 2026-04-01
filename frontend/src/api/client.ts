@@ -11,6 +11,17 @@ import type {
 } from './types';
 
 /**
+ * Get LLM configuration for entity extraction (from Config Tab)
+ */
+function getEntityExtractionConfig(): LLMProviderConfig {
+  const config = getLLMConfig();
+  return {
+    provider: config.entityExtraction.primary,
+    fallback_provider: config.entityExtraction.fallback
+  };
+}
+
+/**
  * Default headers with API key
  */
 const defaultHeaders = {
@@ -157,6 +168,9 @@ export async function uploadDocument(file: File): Promise<UploadResult> {
   const isText = contentType.startsWith('text/') || 
                  file.name.match(/\.(txt|md|csv|json|html|xml|js|ts|py|css)$/i);
   
+  // Get LLM configuration from Config Tab for entity extraction
+  const llmConfig = getEntityExtractionConfig();
+  
   const resp = await fetchWithTimeout(`${API_URL}/api/v1/documents/upload/json`, {
     method: 'POST',
     headers: { 
@@ -166,7 +180,8 @@ export async function uploadDocument(file: File): Promise<UploadResult> {
     body: JSON.stringify({
       content: base64Content,
       id: file.name,
-      content_type: isText ? 'text/plain' : contentType
+      content_type: isText ? 'text/plain' : contentType,
+      llm_config: llmConfig  // Pass LLM config from Config Tab
     })
   }, 120000); // 2 minute timeout for uploads (increased from 1 min)
   
@@ -207,6 +222,23 @@ Your task is to provide comprehensive, detailed answers based on the retrieved c
 
 7. **Expand on concepts**: When discussing technical topics, explain underlying principles and mechanisms, not just surface-level facts.`;
 
+/**
+ * Map frontend mode names to backend mode names
+ * Frontend: 'smart' | 'semantic' | 'entity-lookup' | 'graph-traversal'
+ * Backend:  'smart' | 'semantic-hybrid' | 'entity-lookup' | 'graph-traversal'
+ * 
+ * Note: 'semantic' frontend maps to 'semantic-hybrid' backend for enhanced search
+ */
+function mapQueryMode(mode?: string): string {
+  const modeMap: Record<string, string> = {
+    'smart': 'smart',
+    'semantic': 'semantic-hybrid',  // Semantic button uses hybrid (vector + keyword + relationship)
+    'entity-lookup': 'entity-lookup',
+    'graph-traversal': 'graph-traversal'
+  };
+  return modeMap[mode || ''] || 'smart';  // Default to smart mode
+}
+
 export async function sendQuery(
   request: QueryRequest,
   signal?: AbortSignal
@@ -228,18 +260,20 @@ export async function sendQuery(
   // Enhance request for more comprehensive answers
   const enhancedRequest = {
     ...request,
+    // Map mode names for backend compatibility
+    mode: mapQueryMode(request.mode),
     // Increase chunks retrieved for more context
     top_k: isUltra ? 40 : (request.top_k ?? 20),
     // Enable reranking by default
     rerank: request.rerank ?? true,
-    rerank_method: request.rerank_method ?? 'hybrid',
+    rerank_method: request.rerank_method ?? 'semantic',
     // Use comprehensive system prompt if not provided
     system_prompt: request.system_prompt ?? COMPREHENSIVE_SYSTEM_PROMPT,
     // Request detailed response
     detailed: isComprehensive,
     ultra_comprehensive: isUltra,
     // Temperature based on mode
-    temperature: isUltra ? 0.4 : (request.temperature ?? 0.3),
+    temperature: request.temperature ?? 0.3,
     // Set max_tokens based on mode to prevent truncation
     // Higher limits for comprehensive modes to ensure complete responses
     max_tokens: isUltra ? 8192 : (isComprehensive ? 8192 : 4096),
@@ -252,9 +286,9 @@ export async function sendQuery(
   // Extended timeout based on mode
   let timeoutMs: number;
   if (isUltra) {
-    timeoutMs = 900000;  // 15 min for ultra (5 sections × 3 subsections + conclusion)
+    timeoutMs = 900000;  // 15 min for ultra (6+ sections × 3 subsections + conclusion)
   } else if (isComprehensive) {
-    timeoutMs = 600000;  // 10 min for comprehensive (4 sections × 3 subsections + conclusion)
+    timeoutMs = 600000;  // 10 min for comprehensive (5 sections × 3 subsections + conclusion)
   } else if (request.top_k && request.top_k >= 20) {
     timeoutMs = 300000;  // 5 min for balanced
   } else {
@@ -297,7 +331,7 @@ export async function sendQueryWithFiles(
     system_prompt: isUltra || isComprehensive ? COMPREHENSIVE_SYSTEM_PROMPT : undefined,
     detailed: isComprehensive,
     ultra_comprehensive: isUltra,
-    temperature: isUltra ? 0.4 : (isComprehensive ? 0.3 : 0.3),
+    temperature: isComprehensive ? 0.3 : 0.3,
     // Set max_tokens to prevent truncation
     max_tokens: isUltra ? 8192 : (isComprehensive ? 8192 : 4096),
     // Use the user's message exactly as provided
@@ -326,13 +360,19 @@ export async function sendQueryWithFiles(
 export async function uploadFolder(
   request: FolderUploadRequest
 ): Promise<FolderUploadResult> {
+  // Get LLM configuration from Config Tab for entity extraction
+  const llmConfig = getEntityExtractionConfig();
+  
   const resp = await fetchWithTimeout(`${API_URL}/api/v1/documents/upload/folder/json`, {
     method: 'POST',
     headers: { 
       'Content-Type': 'application/json',
       'X-API-Key': API_KEY 
     },
-    body: JSON.stringify(request)
+    body: JSON.stringify({
+      ...request,
+      llm_config: llmConfig  // Pass LLM config from Config Tab
+    })
   }, 300000);
   
   if (!resp.ok) throw new Error(`Folder upload failed: ${resp.status}`);

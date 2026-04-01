@@ -1,5 +1,5 @@
 #==============================================================================
-# KG RAG System v1.2-beta - Configuration File
+# KG RAG System v2.0-beta - Configuration File
 #==============================================================================
 # This file controls the initialization and startup behavior of the KG RAG system.
 # Modify these settings to customize your deployment.
@@ -206,7 +206,7 @@ performance:
 # Paths Configuration
 #------------------------------------------------------------------------------
 paths:
-  # Base directories (relative to v1.2-beta root)
+  # Base directories (relative to v2.0-beta root)
   backend_dir: "backend"
   frontend_dir: "frontend"
   unified_indexing_dir: "unified_indexing"

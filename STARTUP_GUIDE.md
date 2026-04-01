@@ -1,4 +1,4 @@
-# KG RAG System v1.2-beta - Startup Guide
+# KG RAG System v2.0-beta - Startup Guide
 
 ## Quick Start
 
@@ -103,7 +103,7 @@ Before running the script, ensure you have:
 
 ## Logs
 
-Log files are created in the v1.2-beta directory:
+Log files are created in the v2.0-beta directory:
 
 - `backend.log` - Backend API output and errors
 - `frontend.log` - Frontend build and runtime logs

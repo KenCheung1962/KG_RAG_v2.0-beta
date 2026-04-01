@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import List, Tuple
 
 # Add necessary paths
-sys.path.insert(0, '/Users/ken/clawd_workspace/projects/KG_RAG/proj_ph2/source/postgres')
+# Using local storage.py
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from pgvector_api import EMBEDDING_DIMENSION

@@ -37,6 +37,15 @@ except ImportError:
 
 sys.path.insert(0, '/Users/ken/clawd_workspace/projects/KG_RAG/proj_ph2/source/postgres')
 
+# Import LLM provider functions for configurable entity extraction
+try:
+    from minimax_fixed import llm_complete_with_provider
+except ImportError:
+    # Fallback if import fails
+    async def llm_complete_with_provider(*args, **kwargs):
+        raise Exception("LLM provider module not available")
+    print("[WARNING] minimax_fixed not available - entity extraction will fail")
+
 # =============================================================================
 # RERANKER CONFIGURATION
 # =============================================================================
@@ -523,18 +532,21 @@ async def call_minimax(prompt: str, system_prompt: str = "You are a helpful assi
         print(f"MiniMax API exception: {e}")
         return ""
 
-async def extract_entities_and_relations(text: str) -> tuple:
-    """Extract entities and relationships from text using LLM."""
-    #print(f"[DEBUG] extract_entities_and_relations called with text length: {len(text)}")
-    
+async def extract_entities_and_relations(text: str, llm_config: dict = None) -> tuple:
+    """Extract entities and relationships from text using configurable LLM provider."""
     if len(text) < 50:
-        #print(f"[DEBUG] Text too short: {len(text)} chars")
         return [], []
     
     # Truncate text if too long
     max_text = 8000
     if len(text) > max_text:
         text = text[:max_text] + "..."
+    
+    # Get LLM configuration
+    if llm_config is None:
+        llm_config = {}
+    provider = llm_config.get("provider", "deepseek")
+    fallback = llm_config.get("fallback_provider")
     
     system_prompt = f"""You are an entity extraction expert. Extract entities and relationships from the text.
 Use ONLY these entity types: company, person, product, technology, tool, location, organization, concept, project, task, note, stock, money, percentage, number, date, article, patent, book, journal
@@ -550,9 +562,19 @@ Output in JSON format:
 
 Return only valid JSON, no other text."""
     
-    #print(f"[DEBUG] Calling MiniMax API...")
-    result = await call_minimax(prompt, system_prompt)
-    #print(f"[DEBUG] MiniMax result: {result[:200] if result else 'EMPTY'}")
+    try:
+        # Use configurable LLM provider with fallback support
+        result = await llm_complete_with_provider(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            provider=provider,
+            fallback_provider=fallback,
+            max_tokens=4096,
+            temperature=0.3
+        )
+    except Exception as e:
+        print(f"[Entity Extraction] All LLM providers failed: {e}")
+        return [], []
     
     if not result:
         return [], []
@@ -567,7 +589,8 @@ Return only valid JSON, no other text."""
             entities = data.get("entities", [])
             relationships = data.get("relationships", [])
             return entities, relationships
-    except:
+    except Exception as e:
+        print(f"[Entity Extraction] JSON parsing failed: {e}")
         pass
     
     return [], []
@@ -736,13 +759,21 @@ async def upload_document(
         except:
             pass
         
-        # First create the entity
+        # First create the document entity (WITH EMBEDDING)
+        doc_embedding_text = f"{filename} (document) - Uploaded document"
+        try:
+            doc_embedding = get_ollama_embedding(doc_embedding_text)
+        except Exception as e:
+            print(f"[Upload] Document embedding failed for {filename}: {e}")
+            doc_embedding = None
+        
         entity = Entity(
             entity_id=doc_id,
             entity_type="document",
             name=filename,
             description=f"Document: {filename}",
-            properties={"filename": filename, "type": "uploaded"}
+            properties={"filename": filename, "type": "uploaded"},
+            embedding=doc_embedding
         )
         try:
             await storage.create_entity(entity)
@@ -792,7 +823,7 @@ async def upload_document(
 # JSON upload endpoint for WebUI
 @app.post("/api/v1/documents/upload/json")
 async def upload_document_json(request: Request):
-    """Upload a single file via JSON with entity extraction"""
+    """Upload a single file via JSON with entity extraction (uses Config Tab LLM settings)"""
     filename = "unknown.txt"
     file_size = 0
     
@@ -801,6 +832,12 @@ async def upload_document_json(request: Request):
         content = body.get("content", "")
         filename = body.get("id", body.get("filename", "unknown.txt"))
         file_size = len(content) if isinstance(content, str) else len(content.encode())
+        
+        # Get LLM configuration from request (sent from Config Tab)
+        llm_config = body.get("llm_config", {})
+        provider = llm_config.get("provider", "deepseek")
+        fallback = llm_config.get("fallback_provider")
+        print(f"[Upload] Using LLM provider: {provider}" + (f" (fallback: {fallback})" if fallback else ""))
         
         # Decode base64 if provided
         if content:
@@ -834,13 +871,22 @@ async def upload_document_json(request: Request):
         except:
             pass
         
-        # First create the document entity
+        # First create the document entity (WITH EMBEDDING)
+        # Generate embedding for document entity
+        doc_embedding_text = f"{filename} (document) - Uploaded document"
+        try:
+            doc_embedding = get_ollama_embedding(doc_embedding_text)
+        except Exception as e:
+            print(f"[Upload] Document embedding failed for {filename}: {e}")
+            doc_embedding = None
+        
         entity = Entity(
             entity_id=doc_id,
             entity_type="document",
             name=filename,
             description=f"Document: {filename}",
-            properties={"filename": filename, "type": "uploaded"}
+            properties={"filename": filename, "type": "uploaded"},
+            embedding=doc_embedding
         )
         try:
             await storage.create_entity(entity)
@@ -873,31 +919,53 @@ async def upload_document_json(request: Request):
                 log_upload_failure(filename, f"Chunk {i} creation failed: {str(e)}", file_size)
                 pass
         
-        # Extract entities and relationships using LLM
+        # Extract entities and relationships using LLM (with configurable provider)
         extracted_entities = []
         extracted_relations = []
         
-        if text and len(text) > 100 and MINIMAX_API_KEY:
+        if text and len(text) > 100:
             try:
-                extracted_entities, extracted_relations = await extract_entities_and_relations(text)
+                extracted_entities, extracted_relations = await extract_entities_and_relations(
+                    text, 
+                    llm_config={"provider": provider, "fallback_provider": fallback}
+                )
+                print(f"[Upload] Extracted {len(extracted_entities)} entities, {len(extracted_relations)} relationships")
             except Exception as e:
                 log_upload_failure(filename, f"Entity extraction failed: {str(e)}", file_size)
+                print(f"[Upload] Entity extraction error: {e}")
             
-            # Create extracted entities
+            # Create extracted entities (WITH EMBEDDINGS)
             entity_ids_created = set()
+            entities_embedded = 0
             for ent in extracted_entities:
                 ent_name = ent.get("name", "")
                 ent_type = ent.get("type", "concept")
+                ent_description = ent.get("description", "")
                 if ent_name and ent_name not in entity_ids_created:
                     ent_id = hashlib.md5(ent_name.encode()).hexdigest()[:12]
                     ent_id = f"ent_{ent_id}"
+                    
+                    # Generate embedding text for entity
+                    # Format: "EntityName (entity_type) - description"
+                    embedding_text = f"{ent_name} ({ent_type})"
+                    if ent_description:
+                        embedding_text += f" - {ent_description}"
+                    
+                    # Generate embedding using Ollama
+                    try:
+                        ent_embedding = get_ollama_embedding(embedding_text)
+                        entities_embedded += 1
+                    except Exception as e:
+                        print(f"[Upload] Entity embedding failed for {ent_name}: {e}")
+                        ent_embedding = None
                     
                     ent_entity = Entity(
                         entity_id=ent_id,
                         entity_type=ent_type,
                         name=ent_name,
-                        description=f"Extracted from {filename}",
-                        properties={"source": filename, "extracted": True}
+                        description=ent_description or f"Extracted from {filename}",
+                        properties={"source": filename, "extracted": True},
+                        embedding=ent_embedding
                     )
                     try:
                         await storage.create_entity(ent_entity)
@@ -1013,13 +1081,20 @@ async def upload_folder(folder_path: str = Form(...)):
                         
                         doc_id = hashlib.md5(filepath.encode()).hexdigest()[:12]
                         
-                        # First create entity
+                        # First create document entity (WITH EMBEDDING)
+                        doc_embedding_text = f"{filename} (document) - Folder upload"
+                        try:
+                            doc_embedding = get_ollama_embedding(doc_embedding_text)
+                        except:
+                            doc_embedding = None
+                        
                         entity = Entity(
                             entity_id=doc_id,
                             entity_type="document",
                             name=filename,
                             description=f"Document: {filename}",
-                            properties={"filename": filename, "path": filepath, "type": "folder"}
+                            properties={"filename": filename, "path": filepath, "type": "folder"},
+                            embedding=doc_embedding
                         )
                         try:
                             await storage.create_entity(entity)
@@ -1080,9 +1155,15 @@ def save_processed_files(files_set):
     with open(PROCESSED_FILES_PATH, 'w') as f:
         json.dump(list(files_set), f)
 
-async def process_single_file(filepath: str, filename: str, skip_existing: bool = True):
+async def process_single_file(filepath: str, filename: str, skip_existing: bool = True, llm_config: dict = None):
     """Process a single file - extract chunks, entities, relationships."""
     doc_id = hashlib.md5(filepath.encode()).hexdigest()[:12]
+    
+    # Get LLM configuration
+    if llm_config is None:
+        llm_config = {}
+    provider = llm_config.get("provider", "deepseek")
+    fallback = llm_config.get("fallback_provider")
     
     # Check if already processed (skip if exists)
     if skip_existing:
@@ -1099,13 +1180,20 @@ async def process_single_file(filepath: str, filename: str, skip_existing: bool 
         if not text or len(text.strip()) < 10:
             return {"filename": filename, "status": "skipped", "reason": "empty_file"}
         
-        # Create document entity
+        # Create document entity (WITH EMBEDDING)
+        doc_embedding_text = f"{filename} (document) - Folder upload"
+        try:
+            doc_embedding = get_ollama_embedding(doc_embedding_text)
+        except:
+            doc_embedding = None
+        
         entity = Entity(
             entity_id=doc_id,
             entity_type="document",
             name=filename,
             description=f"Document: {filename}",
-            properties={"filename": filename, "path": filepath, "type": "folder"}
+            properties={"filename": filename, "path": filepath, "type": "folder"},
+            embedding=doc_embedding
         )
         try:
             await storage.create_entity(entity)
@@ -1133,12 +1221,15 @@ async def process_single_file(filepath: str, filename: str, skip_existing: bool 
             except:
                 pass
         
-        # Extract entities and relationships using LLM
+        # Extract entities and relationships using LLM (with configurable provider)
         entities_extracted = 0
         relationships_extracted = 0
         
-        if text and len(text) > 100 and MINIMAX_API_KEY:
-            extracted_entities, extracted_relations = await extract_entities_and_relations(text)
+        if text and len(text) > 100:
+            extracted_entities, extracted_relations = await extract_entities_and_relations(
+                text,
+                llm_config={"provider": provider, "fallback_provider": fallback}
+            )
             
             # Deduplicate entities by name
             unique_entities = {}
@@ -1163,20 +1254,37 @@ async def process_single_file(filepath: str, filename: str, skip_existing: bool 
                         seen_rels.add(rel_key)
                         unique_relations.append(rel)
             
-            # Create extracted entities
+            # Create extracted entities (WITH EMBEDDINGS)
             entity_ids_created = set()
+            entities_embedded = 0
             for ent_name, ent in unique_entities.items():
                 ent_type = ent.get("type", "concept")
+                ent_description = ent.get("description", "")
                 if ent_name and ent_name not in entity_ids_created:
                     ent_id = hashlib.md5(ent_name.encode()).hexdigest()[:12]
                     ent_id = f"ent_{ent_id}"
+                    
+                    # Generate embedding text for entity
+                    # Format: "EntityName (entity_type) - description"
+                    embedding_text = f"{ent_name} ({ent_type})"
+                    if ent_description:
+                        embedding_text += f" - {ent_description}"
+                    
+                    # Generate embedding using Ollama
+                    try:
+                        ent_embedding = get_ollama_embedding(embedding_text)
+                        entities_embedded += 1
+                    except Exception as e:
+                        print(f"[Folder Upload] Entity embedding failed for {ent_name}: {e}")
+                        ent_embedding = None
                     
                     ent_entity = Entity(
                         entity_id=ent_id,
                         entity_type=ent_type,
                         name=ent.get("name", ent_name),
-                        description=ent.get("description", f"Extracted from {filename}"),
-                        properties={"source": filename, "extracted": True}
+                        description=ent_description or f"Extracted from {filename}",
+                        properties={"source": filename, "extracted": True},
+                        embedding=ent_embedding
                     )
                     try:
                         await storage.create_entity(ent_entity)
@@ -1247,6 +1355,12 @@ async def upload_folder_json(request: Request):
         parallel = body.get("parallel", True)
         skip_existing = body.get("skip_existing", True)
         
+        # Get LLM configuration from request (sent from Config Tab)
+        llm_config = body.get("llm_config", {})
+        provider = llm_config.get("provider", "deepseek")
+        fallback = llm_config.get("fallback_provider")
+        print(f"[Folder Upload] Using LLM provider: {provider}" + (f" (fallback: {fallback})" if fallback else ""))
+        
         if not folder_path:
             raise HTTPException(status_code=400, detail="folder_path is required")
         
@@ -1289,7 +1403,7 @@ async def upload_folder_json(request: Request):
             
             if parallel:
                 # Parallel async processing
-                tasks = [process_single_file(fp, fn, skip_existing) for fp, fn in batch]
+                tasks = [process_single_file(fp, fn, skip_existing, llm_config) for fp, fn in batch]
                 batch_results = await asyncio.gather(*tasks, return_exceptions=True)
                 
                 for br in batch_results:
@@ -1306,7 +1420,7 @@ async def upload_folder_json(request: Request):
             else:
                 # Sequential processing
                 for filepath, filename in batch:
-                    result = await process_single_file(filepath, filename, skip_existing)
+                    result = await process_single_file(filepath, filename, skip_existing, llm_config)
                     results.append(result)
                     if result.get("status") == "processed":
                         processed_files.add(filename)
@@ -1666,7 +1780,7 @@ Output format:
     content_template = f"""<query-h1>{query}</query-h1>
 
 <query-h2>{exec_summary_label}</query-h2>
-[Write {exec_words}+ words overview. Cite multiple sources like [1], [2], [3].]
+[Write {exec_words}+ words overview. Cite at least 8+ different sources like [1], [2], [3], [4], [5], [6], [7], [8].]
 
 """
     
@@ -1677,15 +1791,15 @@ Output format:
 """
         for sub_idx, sub_title in enumerate(section['subsections'][:num_subsections], 1):
             content_template += f"""<query-h3>{sec_idx}.{sub_idx} {sub_title}</query-h3>
-[Write {sub_words}+ words. Include 3-5 citations from different sources. Use paragraphs only, no bullets.]
+[Write {sub_words}+ words. Include 3-5 citations from different sources. Vary between sources [1] through [8] and beyond. Use paragraphs only, no bullets.]
 
 """
     
     content_template += f"""<query-h2>{conclusion_label}</query-h2>
-[Write {concl_words}+ words synthesizing key insights. Include 3-5 varied citations.]
+[Write {concl_words}+ words synthesizing key insights. Include citations from at least 8+ different sources.]
 
 <query-h2>{references_label}</query-h2>
-[List all cited sources]"""
+[List ALL cited sources - MINIMUM 8 different sources required]"""
     
     # Step 2: Generate ALL content in ONE API call
     full_prompt = f"""Write a COMPREHENSIVE academic article about: {query}
@@ -1704,7 +1818,7 @@ STRICT REQUIREMENTS:
 5. Math: Use Unicode |ψ⟩, α, β, ∑ - NEVER LaTeX
 6. Citations: Use <span class="citation-ref">[N]</span> format
 7. Use flowing paragraphs ONLY - NO bullet points
-8. Cite from MULTIPLE sources - vary between [1], [2], [3], [4], [5]
+8. Cite from MULTIPLE sources - vary between [1], [2], [3], [4], [5], [6], [7], [8] and beyond (use at least 8+ different sources)
 9. Write COMPLETE content - do NOT stop early
 
 MANDATORY OUTPUT FORMAT - Use EXACTLY this structure:
@@ -1723,13 +1837,14 @@ CRITICAL:
 
 ABSOLUTE RULES:
 1. Use EXACT format: <query-h1>, <query-h2>, <query-h3> tags
-2. Executive Summary: {exec_words}+ words
-3. Each subsection: {sub_words}+ words (4-6 sentences)
-4. Conclusion: {concl_words}+ words
+2. Executive Summary: {exec_words}+ words with at least 8+ different source citations
+3. Each subsection: {sub_words}+ words (4-6 sentences) with citations from varied sources
+4. Conclusion: {concl_words}+ words with citations from at least 8+ different sources
 5. Use <span class="citation-ref">[N]</span> for citations
 6. NEVER use LaTeX - use Unicode math
 7. NO bullet points - flowing paragraphs only
 8. MUST include ALL sections, Conclusion, AND References
+9. References section MUST list at least 8 different sources
 
 {lang_instr}""",
             provider=provider,
@@ -2227,21 +2342,790 @@ def is_chunk_content_relevant(content: str, query: str, min_matches: int = 1) ->
     return is_relevant, matches, matched_terms
 
 
+# ============ Search Mode Implementations ============
+
+async def search_smart(
+    query: str,
+    query_embedding: List[float],
+    top_k: int = 20,
+    llm_config: dict = None
+) -> List[Dict]:
+    """
+    SMART Mode: Multi-layer unified search combining ALL embedding types and strategies.
+    
+    Layers:
+    1. Semantic Chunk Search (primary foundation)
+    2. Entity Discovery & Expansion (entity embeddings)
+    3. Relationship Enhancement (relationship embeddings)
+    4. Keyword Boosting (keyword extraction)
+    5. Multi-source Fusion & Intelligent Ranking
+    """
+    logger.info(f"[Smart] Starting multi-layer unified search for: {query[:50]}...")
+    
+    from storage import DistanceMetric
+    all_chunks = []
+    
+    # =================================================================
+    # LAYER 1: SEMANTIC CHUNK SEARCH (Foundation)
+    # =================================================================
+    try:
+        chunk_results = await storage.search_chunks(
+            query_vector=query_embedding,
+            limit=top_k * 2,  # Get more for fusion
+            distance_metric=DistanceMetric.COSINE,
+            match_threshold=0.25
+        )
+        
+        for chunk in chunk_results:
+            all_chunks.append({
+                'content': chunk.content,
+                'source': chunk.source,
+                'chunk_id': chunk.chunk_id,
+                'entity_id': chunk.entity_id,
+                'similarity': chunk.similarity,
+                'source_layer': 'semantic_chunk',
+                'base_score': chunk.similarity
+            })
+        
+        logger.info(f"[Smart] Layer 1 - Semantic chunks: {len(chunk_results)}")
+    except Exception as e:
+        logger.warning(f"[Smart] Layer 1 failed: {e}")
+    
+    # =================================================================
+    # LAYER 2: ENTITY DISCOVERY (Entity Embeddings)
+    # =================================================================
+    entity_ids_found = set()
+    entity_scores = {}
+    
+    try:
+        entity_results = await storage.search_entities(
+            query_vector=query_embedding,
+            limit=15,
+            distance_metric=DistanceMetric.COSINE
+        )
+        
+        for entity in entity_results:
+            entity_id = entity.get('entity_id')
+            entity_ids_found.add(entity_id)
+            entity_scores[entity_id] = entity.get('similarity', 0.5)
+        
+        logger.info(f"[Smart] Layer 2 - Entities discovered: {len(entity_results)}")
+    except Exception as e:
+        logger.warning(f"[Smart] Layer 2 failed: {e}")
+    
+    # =================================================================
+    # LAYER 3: RELATIONSHIP ENHANCEMENT (Relationship Embeddings)
+    # =================================================================
+    related_entity_ids = set()
+    relationship_scores = {}
+    
+    try:
+        # Search relationship embeddings
+        rel_results = await storage.search_relationships(
+            query_vector=query_embedding,
+            limit=20,
+            distance_metric=DistanceMetric.COSINE,
+            match_threshold=0.4
+        )
+        
+        # Extract entities from matching relationships
+        for rel in rel_results:
+            source_id = rel.get('source_id')
+            target_id = rel.get('target_id')
+            rel_score = rel.get('similarity', 0.5)
+            
+            if source_id:
+                related_entity_ids.add(source_id)
+                if source_id not in relationship_scores:
+                    relationship_scores[source_id] = 0
+                relationship_scores[source_id] += rel_score * 0.15
+            
+            if target_id:
+                related_entity_ids.add(target_id)
+                if target_id not in relationship_scores:
+                    relationship_scores[target_id] = 0
+                relationship_scores[target_id] += rel_score * 0.15
+        
+        # Also traverse from discovered entities
+        for entity_id in list(entity_ids_found)[:5]:
+            try:
+                related = await storage.get_related_entities(
+                    entity_id=entity_id,
+                    max_depth=1,
+                    limit_per_level=6
+                )
+                
+                for rel in related:
+                    rel_id = rel.get('related_entity_id')
+                    if rel_id:
+                        related_entity_ids.add(rel_id)
+                        weight = rel.get('weight', 1.0)
+                        if rel_id not in relationship_scores:
+                            relationship_scores[rel_id] = 0
+                        relationship_scores[rel_id] += weight * 0.08
+            except Exception:
+                pass
+        
+        # Add relationship descriptions as context
+        for rel in rel_results[:10]:
+            desc = rel.get('description') or f"{rel.get('source_id')} {rel.get('relationship_type')} {rel.get('target_id')}"
+            all_chunks.append({
+                'content': f"[Relationship] {desc}",
+                'source': 'knowledge_graph',
+                'chunk_id': f"rel_{rel.get('relationship_id')}",
+                'similarity': rel.get('similarity', 0.5) * 0.9,
+                'source_layer': 'relationship',
+                'base_score': rel.get('similarity', 0.5)
+            })
+        
+        logger.info(f"[Smart] Layer 3 - Related entities: {len(related_entity_ids)}, Relationships: {len(rel_results)}")
+    except Exception as e:
+        logger.warning(f"[Smart] Layer 3 failed: {e}")
+    
+    # =================================================================
+    # LAYER 4: KEYWORD EXTRACTION & BOOSTING
+    # =================================================================
+    keyword_boosts = {}
+    
+    try:
+        high_level, low_level = await extract_keywords_for_search(query, llm_config)
+        
+        # Boost chunks based on keyword matches
+        for chunk in all_chunks:
+            content = chunk['content'].lower()
+            boost = 0.0
+            
+            # Low-level keywords (entities)
+            for kw in low_level:
+                if kw.lower() in content:
+                    boost += 0.06
+            
+            # High-level keywords (concepts)
+            for kw in high_level:
+                if kw.lower() in content:
+                    boost += 0.03
+            
+            if boost > 0:
+                keyword_boosts[chunk['chunk_id']] = boost
+                chunk['similarity'] = chunk.get('similarity', 0.5) + boost
+                chunk['keyword_boost'] = boost
+        
+        logger.info(f"[Smart] Layer 4 - Keywords HL: {high_level[:3]}, LL: {low_level[:3]}")
+    except Exception as e:
+        logger.warning(f"[Smart] Layer 4 failed: {e}")
+    
+    # =================================================================
+    # LAYER 5: ENTITY CHUNK COLLECTION
+    # =================================================================
+    all_entity_ids = entity_ids_found.union(related_entity_ids)
+    
+    for entity_id in all_entity_ids:
+        try:
+            chunks = await storage.get_chunks_by_entity(entity_id, limit=12)
+            
+            # Calculate composite score
+            entity_score = entity_scores.get(entity_id, 0.5)
+            rel_boost = relationship_scores.get(entity_id, 0)
+            
+            for chunk in chunks:
+                base_score = 0.5 + (entity_score * 0.3) + rel_boost
+                
+                all_chunks.append({
+                    'content': chunk.content,
+                    'source': chunk.source,
+                    'chunk_id': chunk.chunk_id,
+                    'entity_id': entity_id,
+                    'similarity': base_score,
+                    'source_layer': 'entity_chunk',
+                    'base_score': base_score,
+                    'entity_score': entity_score
+                })
+        except Exception:
+            pass
+    
+    logger.info(f"[Smart] Layer 5 - Entity chunks from {len(all_entity_ids)} entities")
+    
+    # =================================================================
+    # FINAL: INTELLIGENT FUSION & RANKING
+    # =================================================================
+    
+    # Deduplicate
+    seen_content = set()
+    unique_chunks = []
+    
+    for chunk in all_chunks:
+        content_key = chunk['content'][:150].strip()
+        if content_key not in seen_content:
+            seen_content.add(content_key)
+            unique_chunks.append(chunk)
+    
+    # Apply source layer boosting for diversity
+    layer_boosts = {
+        'semantic_chunk': 1.0,      # Base
+        'relationship': 1.05,       # Slight boost for KG context
+        'entity_chunk': 0.95        # Slight penalty (may be less relevant)
+    }
+    
+    for chunk in unique_chunks:
+        layer = chunk.get('source_layer', 'unknown')
+        boost = layer_boosts.get(layer, 1.0)
+        chunk['similarity'] = chunk.get('similarity', 0.5) * boost
+    
+    # Sort by final similarity
+    unique_chunks.sort(key=lambda x: x.get('similarity', 0), reverse=True)
+    
+    # Log distribution
+    layer_counts = {}
+    for chunk in unique_chunks[:top_k]:
+        layer = chunk.get('source_layer', 'unknown')
+        layer_counts[layer] = layer_counts.get(layer, 0) + 1
+    
+    logger.info(f"[Smart] Returning {len(unique_chunks[:top_k])} chunks. Distribution: {layer_counts}")
+    return unique_chunks[:top_k]
+
+
+async def extract_keywords_for_search(query: str, llm_config: dict = None) -> tuple:
+    """
+    Extract high-level and low-level keywords for enhanced search.
+    High-level: concepts, themes, topics
+    Low-level: specific entities, names, products
+    """
+    try:
+        # Use regex-based extraction as fallback (always works)
+        import re
+        
+        # Extract potential entities (capitalized words, quoted phrases)
+        entities = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', query)
+        quoted = re.findall(r'"([^"]+)"', query)
+        
+        # Extract all meaningful words (3+ chars)
+        all_words = [w.lower() for w in re.findall(r'\b[a-zA-Z]{3,}\b', query)]
+        
+        stop_words = {'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'her', 'was', 'one', 'our', 'out', 'day', 'get', 'has', 'him', 'his', 'how', 'man', 'new', 'now', 'old', 'see', 'two', 'way', 'who', 'boy', 'did', 'its', 'let', 'put', 'say', 'she', 'too', 'use', 'what', 'with', 'have', 'this', 'will', 'your', 'from', 'they', 'know', 'want', 'been', 'good', 'much', 'some', 'time', 'very', 'when', 'come', 'here', 'just', 'like', 'long', 'make', 'many', 'over', 'such', 'take', 'than', 'them', 'well', 'were'}
+        
+        # Low-level keywords: entities and specific terms
+        low_level = list(set([e for e in entities if len(e) > 2] + quoted))
+        
+        # High-level keywords: concepts (filtered words)
+        high_level = list(set([w for w in all_words if w not in stop_words and w not in [l.lower() for l in low_level]]))[:10]
+        
+        return high_level, low_level
+        
+    except Exception as e:
+        logger.error(f"Keyword extraction failed: {e}")
+        return [], []
+
+
+async def search_entity_lookup(
+    query: str,
+    query_embedding: List[float],
+    top_k: int = 20,
+    llm_config: dict = None
+) -> List[Dict]:
+    """
+    Entity-lookup mode: Comprehensive search using ALL embedding types:
+    - Entity embeddings (primary): Find matching entities
+    - Relationship embeddings (enhancement): Find related entities via relationships
+    - Chunk embeddings (content): Direct vector search on chunks + entity chunks
+    - Keywords (boosting): Extract and match keywords for precision
+    """
+    logger.info(f"[Entity-lookup] Starting comprehensive search for: {query[:50]}...")
+    
+    from storage import DistanceMetric
+    all_chunks = []
+    
+    # =================================================================
+    # LAYER 1: ENTITY EMBEDDINGS - Find matching entities
+    # =================================================================
+    entity_results = await storage.search_entities(
+        query_vector=query_embedding,
+        limit=top_k * 3,
+        distance_metric=DistanceMetric.COSINE
+    )
+    
+    if entity_results:
+        logger.info(f"[Entity-lookup] Found {len(entity_results)} entities via entity embeddings")
+    
+    # =================================================================
+    # LAYER 2: KEYWORD EXTRACTION - For entity boosting
+    # =================================================================
+    high_level, low_level = await extract_keywords_for_search(query, llm_config)
+    logger.info(f"[Entity-lookup] Keywords - HL: {high_level[:5]}, LL: {low_level[:5]}")
+    
+    # Boost entity scores based on keyword matches
+    boosted_entities = []
+    for entity in entity_results:
+        entity_name = entity.get('name', '').lower()
+        entity_desc = (entity.get('description') or '').lower()
+        
+        boost = 0.0
+        # Low-level keywords (entity names) get strong boost
+        for kw in low_level:
+            kw_lower = kw.lower()
+            if kw_lower in entity_name:
+                boost += 0.15
+            elif kw_lower in entity_desc:
+                boost += 0.08
+        
+        # High-level keywords (concepts) get medium boost
+        for kw in high_level:
+            if kw.lower() in entity_desc:
+                boost += 0.05
+        
+        entity['similarity'] = entity.get('similarity', 0.5) + boost
+        boosted_entities.append(entity)
+    
+    boosted_entities.sort(key=lambda x: x.get('similarity', 0), reverse=True)
+    top_entities = boosted_entities[:top_k]
+    
+    # =================================================================
+    # LAYER 3: RELATIONSHIP EMBEDDINGS - Find related entities
+    # =================================================================
+    related_entity_ids = set()
+    relationship_boost = {}
+    
+    # Search relationship embeddings directly
+    try:
+        rel_embedding_results = await storage.search_relationships(
+            query_vector=query_embedding,
+            limit=15,
+            distance_metric=DistanceMetric.COSINE,
+            match_threshold=0.5
+        )
+        
+        # Extract entities from matching relationships
+        for rel in rel_embedding_results:
+            source_id = rel.get('source_id')
+            target_id = rel.get('target_id')
+            if source_id:
+                related_entity_ids.add(source_id)
+            if target_id:
+                related_entity_ids.add(target_id)
+        
+        logger.info(f"[Entity-lookup] Found {len(related_entity_ids)} entities via relationship embeddings")
+    except Exception as e:
+        logger.warning(f"[Entity-lookup] Relationship embedding search failed: {e}")
+    
+    # Also get related entities through graph traversal from top entities
+    for entity in top_entities:
+        entity_id = entity.get('entity_id')
+        try:
+            related = await storage.get_related_entities(
+                entity_id=entity_id,
+                max_depth=1,
+                limit_per_level=5
+            )
+            
+            for rel in related:
+                related_id = rel.get('related_entity_id')
+                if related_id and related_id != entity_id:
+                    related_entity_ids.add(related_id)
+                    weight = rel.get('weight', 1.0)
+                    if related_id not in relationship_boost:
+                        relationship_boost[related_id] = 0
+                    relationship_boost[related_id] += weight * 0.1
+                    
+        except Exception as e:
+            logger.warning(f"[Entity-lookup] Failed to get related for {entity_id}: {e}")
+    
+    # =================================================================
+    # LAYER 4: CHUNK EMBEDDINGS - Multiple sources
+    # =================================================================
+    
+    # 4a: Direct chunk vector search (semantic similarity)
+    try:
+        chunk_results = await storage.search_chunks(
+            query_vector=query_embedding,
+            limit=top_k,
+            distance_metric=DistanceMetric.COSINE,
+            match_threshold=0.3
+        )
+        
+        for chunk in chunk_results:
+            all_chunks.append({
+                'content': chunk.content,
+                'source': chunk.source,
+                'chunk_id': chunk.chunk_id,
+                'entity_id': chunk.entity_id,
+                'similarity': chunk.similarity,
+                'source_type': 'chunk_embedding'
+            })
+        
+        logger.info(f"[Entity-lookup] Added {len(chunk_results)} chunks via direct chunk embeddings")
+    except Exception as e:
+        logger.warning(f"[Entity-lookup] Chunk embedding search failed: {e}")
+    
+    # 4b: Chunks from entity-based search (entity + related entities)
+    all_entity_ids = set(e.get('entity_id') for e in top_entities)
+    all_entity_ids.update(related_entity_ids)
+    
+    for entity_id in all_entity_ids:
+        try:
+            chunks = await storage.get_chunks_by_entity(entity_id, limit=15)
+            for chunk in chunks:
+                base_similarity = 0.6
+                
+                # Boost if from top entity
+                if entity_id in [e.get('entity_id') for e in top_entities]:
+                    entity_match = next((e for e in top_entities if e.get('entity_id') == entity_id), None)
+                    if entity_match:
+                        base_similarity = entity_match.get('similarity', 0.7)
+                
+                # Boost if from relationship-expanded entity
+                if entity_id in relationship_boost:
+                    base_similarity += relationship_boost[entity_id]
+                
+                all_chunks.append({
+                    'content': chunk.content,
+                    'source': chunk.source,
+                    'chunk_id': chunk.chunk_id,
+                    'entity_id': entity_id,
+                    'similarity': base_similarity,
+                    'source_type': 'entity_chunk'
+                })
+        except Exception as e:
+            logger.warning(f"[Entity-lookup] Failed to get chunks for {entity_id}: {e}")
+    
+    # =================================================================
+    # LAYER 5: RELATIONSHIP CONTENT - Add relationship descriptions
+    # =================================================================
+    try:
+        # Use already fetched relationship results if available
+        if 'rel_embedding_results' in locals():
+            for rel in rel_embedding_results:
+                desc = rel.get('description') or f"{rel.get('source_id')} {rel.get('relationship_type')} {rel.get('target_id')}"
+                if desc:
+                    all_chunks.append({
+                        'content': f"[Relationship] {desc}",
+                        'source': 'knowledge_graph',
+                        'chunk_id': f"rel_{rel.get('relationship_id')}",
+                        'similarity': rel.get('similarity', 0.5),
+                        'source_type': 'relationship_embedding'
+                    })
+    except Exception as e:
+        logger.warning(f"[Entity-lookup] Relationship content addition failed: {e}")
+    
+    # =================================================================
+    # FINAL: Deduplicate and rank
+    # =================================================================
+    seen_content = set()
+    unique_chunks = []
+    
+    for chunk in all_chunks:
+        content_key = chunk['content'][:150].strip()
+        if content_key not in seen_content:
+            seen_content.add(content_key)
+            unique_chunks.append(chunk)
+    
+    unique_chunks.sort(key=lambda x: x.get('similarity', 0), reverse=True)
+    
+    logger.info(f"[Entity-lookup] Returning {len(unique_chunks[:top_k])} unique chunks "
+                f"(from {len(all_entity_ids)} entities, sources: chunk_emb, entity_emb, rel_emb)")
+    return unique_chunks[:top_k]
+
+
+async def search_graph_traversal(
+    query: str,
+    query_embedding: List[float],
+    top_k: int = 20,
+    max_depth: int = 2,
+    llm_config: dict = None
+) -> List[Dict]:
+    """
+    Graph-traversal mode: Comprehensive graph-based search using ALL embedding types:
+    - Entity embeddings: Find seed entities for traversal
+    - Relationship embeddings: Primary mechanism for relationship-based retrieval
+    - Chunk embeddings: Direct semantic search + entity-linked chunks
+    - Graph reasoning: BFS traversal, path finding, and connectivity analysis
+    """
+    logger.info(f"[Graph-traversal] Starting comprehensive graph search for: {query[:50]}...")
+    
+    from storage import DistanceMetric
+    all_chunks = []
+    
+    # =================================================================
+    # LAYER 1: RELATIONSHIP EMBEDDINGS - Primary relationship-based retrieval
+    # =================================================================
+    matching_relationships = []
+    relationship_entity_ids = set()
+    
+    try:
+        rel_results = await storage.search_relationships(
+            query_vector=query_embedding,
+            limit=20,
+            distance_metric=DistanceMetric.COSINE,
+            match_threshold=0.4
+        )
+        
+        matching_relationships = rel_results
+        
+        # Extract all entities from matching relationships
+        for rel in rel_results:
+            source_id = rel.get('source_id')
+            target_id = rel.get('target_id')
+            if source_id:
+                relationship_entity_ids.add(source_id)
+            if target_id:
+                relationship_entity_ids.add(target_id)
+        
+        logger.info(f"[Graph-traversal] Found {len(rel_results)} relationships via relationship embeddings, "
+                    f"covering {len(relationship_entity_ids)} entities")
+        
+        # Add relationship descriptions as high-value context
+        for rel in rel_results:
+            desc = rel.get('description')
+            rel_type = rel.get('relationship_type', 'related_to')
+            
+            if desc:
+                edge_text = f"[Relationship: {rel_type}] {desc}"
+            else:
+                edge_text = f"[Relationship: {rel_type}] {rel.get('source_id')} → {rel.get('target_id')}"
+            
+            all_chunks.append({
+                'content': edge_text,
+                'source': 'relationship_embedding',
+                'chunk_id': f"rel_{rel.get('relationship_id')}",
+                'similarity': rel.get('similarity', 0.5) * 1.2,  # Boost relationship matches
+                'rel_source': rel.get('source_id'),
+                'rel_target': rel.get('target_id'),
+                'rel_type': rel_type,
+                'source_layer': 'relationship_embedding'
+            })
+            
+    except Exception as e:
+        logger.warning(f"[Graph-traversal] Relationship embedding search failed: {e}")
+    
+    # =================================================================
+    # LAYER 2: ENTITY EMBEDDINGS - Find seed entities for graph expansion
+    # =================================================================
+    seed_entities = await storage.search_entities(
+        query_vector=query_embedding,
+        limit=15,
+        distance_metric=DistanceMetric.COSINE
+    )
+    
+    if seed_entities:
+        logger.info(f"[Graph-traversal] Found {len(seed_entities)} seed entities via entity embeddings")
+    
+    # Combine seed entities with relationship-derived entities
+    all_entity_ids = set(e.get('entity_id') for e in seed_entities)
+    all_entity_ids.update(relationship_entity_ids)
+    
+    # =================================================================
+    # LAYER 3: GRAPH TRAVERSAL - BFS with path finding and reasoning
+    # =================================================================
+    traversed_entities = set()
+    entity_depths = {}
+    entity_paths = {}
+    entity_connection_scores = {}  # How well connected an entity is
+    
+    for seed in seed_entities:
+        seed_id = seed.get('entity_id')
+        seed_name = seed.get('name', 'Unknown')
+        
+        try:
+            # Multi-hop BFS traversal
+            related = await storage.get_related_entities(
+                entity_id=seed_id,
+                max_depth=max_depth,
+                limit_per_level=12
+            )
+            
+            # Mark seed entity
+            if seed_id not in traversed_entities:
+                traversed_entities.add(seed_id)
+                entity_depths[seed_id] = 0
+                entity_paths[seed_id] = [seed_name]
+                entity_connection_scores[seed_id] = 1.0
+            
+            # Process traversed entities with path tracking
+            for rel in related:
+                rel_id = rel.get('related_entity_id')
+                rel_name = rel.get('related_entity_name', 'Unknown')
+                depth = rel.get('depth', 1)
+                
+                if rel_id:
+                    traversed_entities.add(rel_id)
+                    
+                    # Track minimum depth (shortest path)
+                    if rel_id not in entity_depths or depth < entity_depths[rel_id]:
+                        entity_depths[rel_id] = depth
+                        
+                        # Build and store path
+                        rel_path = rel.get('path', [])
+                        if rel_path:
+                            entity_paths[rel_id] = rel_path
+                        else:
+                            entity_paths[rel_id] = [seed_name, rel_name]
+                    
+                    # Increment connection score (more connections = higher score)
+                    if rel_id not in entity_connection_scores:
+                        entity_connection_scores[rel_id] = 0
+                    entity_connection_scores[rel_id] += 1.0 / depth  # Closer connections count more
+                    
+        except Exception as e:
+            logger.warning(f"[Graph-traversal] Failed traversal from {seed_id}: {e}")
+    
+    # Add traversed entities to our collection
+    all_entity_ids.update(traversed_entities)
+    
+    logger.info(f"[Graph-traversal] Graph traversal discovered {len(traversed_entities)} entities "
+                f"with depths {set(entity_depths.values()) if entity_depths else {0}}")
+    
+    # =================================================================
+    # LAYER 4: CHUNK EMBEDDINGS - Multiple retrieval strategies
+    # =================================================================
+    
+    # 4a: Direct chunk vector search (semantic similarity to query)
+    try:
+        chunk_results = await storage.search_chunks(
+            query_vector=query_embedding,
+            limit=top_k // 2,  # Get some direct semantic matches
+            distance_metric=DistanceMetric.COSINE,
+            match_threshold=0.3
+        )
+        
+        for chunk in chunk_results:
+            all_chunks.append({
+                'content': chunk.content,
+                'source': chunk.source,
+                'chunk_id': chunk.chunk_id,
+                'entity_id': chunk.entity_id,
+                'similarity': chunk.similarity,
+                'source_layer': 'chunk_embedding'
+            })
+        
+        logger.info(f"[Graph-traversal] Added {len(chunk_results)} chunks via direct chunk embeddings")
+    except Exception as e:
+        logger.warning(f"[Graph-traversal] Direct chunk search failed: {e}")
+    
+    # 4b: Chunks from all discovered entities (entity-linked content)
+    entity_chunk_count = 0
+    for entity_id in all_entity_ids:
+        try:
+            chunks = await storage.get_chunks_by_entity(entity_id, limit=25)
+            entity_chunk_count += len(chunks)
+            
+            # Calculate composite score based on multiple factors
+            depth = entity_depths.get(entity_id, 0)
+            connection_score = entity_connection_scores.get(entity_id, 0)
+            
+            # Depth factor: closer to seed = more relevant
+            depth_factor = 1.0 - (depth * 0.15)  # 1.0, 0.85, 0.7 for depths 0, 1, 2
+            
+            # Connection factor: highly connected = more central
+            connection_factor = min(connection_score * 0.1, 0.3)  # Cap at 0.3
+            
+            # Seed entity bonus
+            seed_bonus = 0.2 if entity_id in [e.get('entity_id') for e in seed_entities] else 0
+            
+            base_similarity = 0.5 + (depth_factor * 0.25) + connection_factor + seed_bonus
+            
+            path = entity_paths.get(entity_id, [])
+            
+            for chunk in chunks:
+                chunk_meta = {
+                    'content': chunk.content,
+                    'source': chunk.source,
+                    'chunk_id': chunk.chunk_id,
+                    'entity_id': entity_id,
+                    'similarity': base_similarity,
+                    'depth': depth,
+                    'path': ' → '.join(path[-3:]) if len(path) > 1 else 'direct',
+                    'connection_score': connection_score,
+                    'source_layer': 'graph_traversal'
+                }
+                all_chunks.append(chunk_meta)
+                
+        except Exception as e:
+            logger.warning(f"[Graph-traversal] Failed to get chunks for {entity_id}: {e}")
+    
+    logger.info(f"[Graph-traversal] Retrieved {entity_chunk_count} chunks from {len(all_entity_ids)} entities")
+    
+    # =================================================================
+    # LAYER 5: GRAPH REASONING - Add connectivity insights
+    # =================================================================
+    
+    # Add high-centrality entity summaries
+    central_entities = sorted(
+        [(eid, score) for eid, score in entity_connection_scores.items()],
+        key=lambda x: x[1],
+        reverse=True
+    )[:5]
+    
+    for entity_id, score in central_entities:
+        if score > 2:  # Only include highly connected entities
+            try:
+                entity_result = await storage.get_entity(entity_id)
+                if entity_result:
+                    entity_name = entity_result.get('name', 'Unknown')
+                    entity_desc = entity_result.get('description', '')
+                    path = entity_paths.get(entity_id, [entity_name])
+                    
+                    reasoning_text = f"[Graph Hub] {entity_name} is a central node in the knowledge graph "
+                    reasoning_text += f"(connected to {int(score)} entities, path: {' → '.join(path[-3:])}). "
+                    if entity_desc:
+                        reasoning_text += f"Description: {entity_desc[:200]}"
+                    
+                    all_chunks.append({
+                        'content': reasoning_text,
+                        'source': 'graph_reasoning',
+                        'chunk_id': f"hub_{entity_id}",
+                        'entity_id': entity_id,
+                        'similarity': 0.7 + min(score * 0.02, 0.2),  # Score based on centrality
+                        'source_layer': 'graph_reasoning'
+                    })
+            except Exception as e:
+                logger.warning(f"[Graph-traversal] Failed to get hub entity {entity_id}: {e}")
+    
+    # =================================================================
+    # FINAL: Deduplicate, rank, and return
+    # =================================================================
+    seen_content = set()
+    unique_chunks = []
+    
+    for chunk in all_chunks:
+        content_key = chunk['content'][:150].strip()
+        if content_key not in seen_content:
+            seen_content.add(content_key)
+            unique_chunks.append(chunk)
+    
+    # Sort by composite similarity score
+    unique_chunks.sort(key=lambda x: x.get('similarity', 0), reverse=True)
+    
+    # Log layer distribution
+    layer_counts = {}
+    for chunk in unique_chunks[:top_k]:
+        layer = chunk.get('source_layer', 'unknown')
+        layer_counts[layer] = layer_counts.get(layer, 0) + 1
+    
+    logger.info(f"[Graph-traversal] Returning {len(unique_chunks[:top_k])} unique chunks "
+                f"from {len(all_entity_ids)} entities. Layer distribution: {layer_counts}")
+    
+    return unique_chunks[:top_k]
+
+
 # ============ Chat ============
 @app.post("/api/v1/chat")
 async def chat(request: dict):
     """
     RAG chat with Vector Similarity Search + Reranking for improved quality.
+    Supports multiple search modes: semantic (default), entity-lookup, graph-traversal.
     
     Request body can include:
     - query/message: The search query
+    - mode: Search mode - "semantic" (default), "entity-lookup", "graph-traversal"
     - top_k: Number of chunks to retrieve (default: from config)
     - rerank: Whether to rerank results (default: true)
     - rerank_method: "hybrid", "vector", "keyword", or "none"
     - llm_config: LLM provider configuration {provider: "deepseek"|"minimax", fallback_provider: ...}
+    - max_depth: For graph-traversal mode (default: 2)
     """
     # Accept both "query" and "message" fields
     query = request.get("query") or request.get("message", "")
+    
+    # Get search mode (default: semantic)
+    mode = request.get("mode", "semantic").lower()
     
     # Get LLM configuration from request (if provided)
     llm_config = request.get("llm_config", {})
@@ -2252,6 +3136,7 @@ async def chat(request: dict):
     requested_top_k = request.get("top_k", RERANK_CONFIG.final_top_k)
     use_rerank = request.get("rerank", RERANK_CONFIG.enabled)
     rerank_method = request.get("rerank_method", RERANK_CONFIG.method)
+    max_depth = request.get("max_depth", 2)
     
     if not query or not query.strip():
         return {
@@ -2263,41 +3148,88 @@ async def chat(request: dict):
         }
     
     # =================================================================
-    # STEP 1: VECTOR SIMILARITY SEARCH (Initial Retrieval)
+    # STEP 1: SEARCH BASED ON MODE
     # =================================================================
     
-    # Generate query embedding
+    # Generate query embedding (needed for all modes)
     query_embedding = get_ollama_embedding(query)
     
-    # Fetch more chunks than needed for reranking
-    initial_k = RERANK_CONFIG.initial_top_k if use_rerank else requested_top_k
+    logger.info(f"[Chat] Mode: {mode}, Query: {query[:50]}...")
     
-    try:
-        # Use hybrid search from storage
-        from storage import DistanceMetric
-        vector_results = await storage.search_chunks(
-            query_vector=query_embedding,
-            limit=initial_k,
-            distance_metric=DistanceMetric.COSINE,
-            match_threshold=0.2  # Lower threshold to get more candidates
-        )
+    result = []
+    
+    if mode == "smart":
+        # Smart mode: Multi-layer unified search combining all strategies
+        try:
+            result = await search_smart(
+                query=query,
+                query_embedding=query_embedding,
+                top_k=requested_top_k,
+                llm_config=llm_config
+            )
+            logger.info(f"[Chat] Smart mode returned {len(result)} chunks")
+        except Exception as e:
+            logger.error(f"[Chat] Smart mode failed: {e}, falling back to semantic")
+            mode = "semantic"  # Fallback to semantic
+    
+    elif mode == "entity-lookup":
+        # Entity-centric search with relationship enhancement
+        try:
+            result = await search_entity_lookup(
+                query=query,
+                query_embedding=query_embedding,
+                top_k=requested_top_k,
+                llm_config=llm_config
+            )
+            logger.info(f"[Chat] Entity-lookup returned {len(result)} chunks")
+        except Exception as e:
+            logger.error(f"[Chat] Entity-lookup failed: {e}, falling back to semantic")
+            mode = "semantic"  # Fallback to semantic
+    
+    elif mode == "graph-traversal":
+        # Graph-based traversal search
+        try:
+            result = await search_graph_traversal(
+                query=query,
+                query_embedding=query_embedding,
+                top_k=requested_top_k,
+                max_depth=max_depth,
+                llm_config=llm_config
+            )
+            logger.info(f"[Chat] Graph-traversal returned {len(result)} chunks")
+        except Exception as e:
+            logger.error(f"[Chat] Graph-traversal failed: {e}, falling back to semantic")
+            mode = "semantic"  # Fallback to semantic
+    
+    if mode in ("semantic", "semantic-hybrid") or not result:
+        # Default: Semantic chunk search
+        initial_k = RERANK_CONFIG.initial_top_k if use_rerank else requested_top_k
         
-        # Convert to dict format
-        result = []
-        for r in vector_results:
-            result.append({
-                "content": r.content,
-                "source": r.source,
-                "similarity": r.similarity,
-                "chunk_id": r.chunk_id,
-                "metadata": r.metadata
-            })
-        
-        rerank_logger.info(f"Vector search returned {len(result)} chunks for query: {query[:50]}...")
-        
-    except Exception as e:
-        rerank_logger.error(f"Vector search failed: {e}")
-        result = []
+        try:
+            from storage import DistanceMetric
+            vector_results = await storage.search_chunks(
+                query_vector=query_embedding,
+                limit=initial_k,
+                distance_metric=DistanceMetric.COSINE,
+                match_threshold=0.2
+            )
+            
+            # Convert to dict format
+            result = []
+            for r in vector_results:
+                result.append({
+                    "content": r.content,
+                    "source": r.source,
+                    "similarity": r.similarity,
+                    "chunk_id": r.chunk_id,
+                    "metadata": r.metadata
+                })
+            
+            rerank_logger.info(f"[Chat] Semantic search returned {len(result)} chunks")
+            
+        except Exception as e:
+            rerank_logger.error(f"[Chat] Semantic search failed: {e}")
+            result = []
     
     # Fallback to keyword search if vector search returns nothing
     if not result:
@@ -2580,7 +3512,7 @@ async def chat(request: dict):
         import asyncio
         import sys
         import os
-        sys.path.insert(0, '/Users/ken/clawd_workspace/projects/KG_RAG/v1.2-beta/unified_indexing')
+        # Import from local backend directory
         
         # Get mode flags from request for use in outer scope
         is_ultra = request.get("ultra_comprehensive", False)
@@ -3385,9 +4317,7 @@ Structure:
 
 
 # ============ LLM Response Generator ============
-import sys
-sys.path.insert(0, '/Users/ken/clawd_workspace/projects/KG_RAG/v1.2-beta/unified_indexing')
-from minimax_fixed import minimax_complete, llm_complete_with_provider
+# Note: llm_complete_with_provider imported at top of file
 
 async def generate_llm_response(query: str, context: str, target_words: str = "~1000", detail_level: str = "balanced", llm_config: dict = None) -> str:
     """Generate a well-formatted response using LLM from provided context"""
@@ -3642,10 +4572,16 @@ User Question: {query}
 # ============ Chat with Document ============
 @app.post("/api/v1/chat/with-doc")
 async def chat_with_doc(request: dict):
-    """Query with document upload - searches BOTH uploaded files AND existing database"""
+    """
+    Query with document upload - searches BOTH uploaded files AND existing database.
+    Supports multiple search modes: semantic (default), entity-lookup, graph-traversal.
+    """
     message = request.get("message", "")
     filename = request.get("filename", "")
     filenames = request.get("filenames", [])  # Support multiple files
+    
+    # Get search mode (default: semantic)
+    search_mode = request.get("mode", "semantic").lower()
     
     # Get LLM configuration from request (if provided)
     llm_config = request.get("llm_config", {})
@@ -3656,6 +4592,7 @@ async def chat_with_doc(request: dict):
     is_ultra = request.get("ultra_comprehensive", False)
     is_comprehensive = request.get("detailed", False)
     top_k = request.get("top_k", 20)
+    max_depth = request.get("max_depth", 2)
     
     # Word count targets based on mode (+25% buffer to prevent truncation)
     if is_ultra:
@@ -3699,7 +4636,7 @@ async def chat_with_doc(request: dict):
     doc_ids = [hashlib.md5(f.encode()).hexdigest()[:12] for f in file_list] if file_list else []
     
     # DEBUG: Log what's being received
-    print(f"[DEBUG] chat/with-doc: message='{message}', mode={detail_level}, file_list={file_list}, doc_ids={doc_ids}")
+    print(f"[DEBUG] chat/with-doc: message='{message}', detail_level={detail_level}, search_mode={search_mode}, file_list={file_list}, doc_ids={doc_ids}")
     
     # Collect results from BOTH uploaded files AND entire database
     all_results = []

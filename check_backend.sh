@@ -37,6 +37,6 @@ else
     echo "❌ Backend is NOT running on port 8002"
     echo ""
     echo "Start it with:"
-    echo "  cd /Users/ken/clawd_workspace/projects/KG_RAG/v1.2-beta/backend"
+    echo "  cd /Users/ken/clawd_workspace/projects/KG_RAG/v2.0-beta/backend"
     echo "  python pgvector_api.py"
 fi

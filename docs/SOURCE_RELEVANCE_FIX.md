@@ -92,7 +92,7 @@ To apply the fix:
 kill $(lsof -t -i:8002)
 
 # 2. Start updated backend
-cd /Users/ken/clawd_workspace/projects/KG_RAG/v1.2-beta/backend
+cd /Users/ken/clawd_workspace/projects/KG_RAG/v2.0-beta/backend
 python pgvector_api.py
 ```
 

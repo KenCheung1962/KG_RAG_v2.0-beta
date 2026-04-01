@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-KG RAG System v1.2-beta - Initialization & Startup Script (Python)
+KG RAG System v2.0-beta - Initialization & Startup Script (Python)
 Uses kgrag_config.yaml for configuration
 """
 
@@ -506,7 +506,7 @@ class ServiceManager:
         """Print startup summary"""
         print(f"\n{Colors.GREEN}{Colors.BOLD}")
         print("╔════════════════════════════════════════════════════════════════╗")
-        print("║          KG RAG System v1.2-beta - Running                     ║")
+        print("║          KG RAG System v2.0-beta - Running                     ║")
         print("╚════════════════════════════════════════════════════════════════╝")
         print(f"{Colors.NC}")
         
@@ -644,7 +644,7 @@ class ServiceManager:
         """Main run loop"""
         print(f"\n{Colors.CYAN}{Colors.BOLD}")
         print("╔════════════════════════════════════════════════════════════════╗")
-        print("║          KG RAG System v1.2-beta - Startup Script              ║")
+        print("║          KG RAG System v2.0-beta - Startup Script              ║")
         print("╚════════════════════════════════════════════════════════════════╝")
         print(f"{Colors.NC}\n")
         

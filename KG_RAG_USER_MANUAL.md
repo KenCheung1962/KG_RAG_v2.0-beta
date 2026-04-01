@@ -1,4 +1,4 @@
-# KG RAG System v1.4-beta - User Manual
+# KG RAG System v2.0-beta - User Manual
 
 ## Table of Contents
 
@@ -14,7 +14,7 @@
 
 ## 1. System Overview
 
-The KG RAG (Knowledge Graph Retrieval-Augmented Generation) System v1.4-beta is an advanced document intelligence platform that combines:
+The KG RAG (Knowledge Graph Retrieval-Augmented Generation) System v2.0-beta is an advanced document intelligence platform that combines:
 
 - **Knowledge Graph Construction**: Automatic extraction of entities and relationships
 - **Vector Search**: Semantic document retrieval using pgvector
@@ -25,7 +25,7 @@ The KG RAG (Knowledge Graph Retrieval-Augmented Generation) System v1.4-beta is 
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        KG RAG v1.4-beta                         │
+│                        KG RAG v2.0-beta                         │
 ├─────────────────────────────────────────────────────────────────┤
 │  WebUI (Vite)        │  Backend API (FastAPI)     │  Database   │
 │  Port: 8081          │  Port: 8002                │  PostgreSQL │
@@ -72,7 +72,7 @@ The KG RAG (Knowledge Graph Retrieval-Augmented Generation) System v1.4-beta is 
 The system is started using the Python startup script `start_kg_rag.py`:
 
 ```bash
-cd /v1.4-beta
+cd /v2.0-beta
 python3 start_kg_rag.py
 ```
 
@@ -165,7 +165,7 @@ There are several ways to stop the KG RAG system properly:
 The `stop_kg_rag.sh` script safely terminates all running services:
 
 ```bash
-cd /v1.4-beta
+cd /v2.0-beta
 ./stop_kg_rag.sh
 ```
 
@@ -1209,5 +1209,5 @@ done
 
 ---
 
-*Document Version: v1.4-beta*  
+*Document Version: v2.0-beta*  
 *Last Updated: March 29, 2026*

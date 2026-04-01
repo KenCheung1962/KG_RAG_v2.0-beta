@@ -15,7 +15,7 @@ from typing import List, Tuple
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Add necessary paths
-sys.path.insert(0, '/Users/ken/clawd_workspace/projects/KG_RAG/proj_ph2/source/postgres')
+# Using local storage.py
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Embedding dimension

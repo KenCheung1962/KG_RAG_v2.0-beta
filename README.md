@@ -1,4 +1,4 @@
-# KG RAG System v1.4-beta
+# KG RAG System v2.0-beta
 
 Unified Knowledge Graph RAG System with PostgreSQL + pgvector backend and Vite + TypeScript frontend.
 
@@ -44,7 +44,7 @@ open http://localhost:8081
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        KG RAG v1.4-beta                         │
+│                        KG RAG v2.0-beta                         │
 ├─────────────────────────────────────────────────────────────────┤
 │  WebUI (Vite)        │  Backend API (FastAPI)     │  Database   │
 │  Port: 8081          │  Port: 8002                │  PostgreSQL │
@@ -76,7 +76,7 @@ open http://localhost:8081
 ## 📁 Folder Structure
 
 ```
-v1.4-beta/
+v2.0-beta/
 ├── backend/                   # FastAPI Backend Server
 │   ├── pgvector_api.py        # Main API with RAG chat endpoints
 │   ├── api_client.py          # LLM provider clients (DeepSeek, MiniMax)
@@ -134,13 +134,20 @@ ollama:
 
 ## ✨ Features
 
-### Query Modes
+### Query Modes (4 Modes)
 
-| Mode | Description |
-|------|-------------|
-| **Semantic** (default) | Vector similarity + keyword fallback |
-| **Entity-lookup** | Entity-focused search |
-| **Graph-traversal** | Relationship graph search |
+| Mode | Description | Best For |
+|------|-------------|----------|
+| **Smart** ⭐ (default) | Multi-layer unified search using ALL embeddings | All queries (recommended) |
+| **Semantic** | Vector similarity on chunks | Simple semantic queries |
+| **Entity-lookup** | Entity-centric with keyword boost | Entity-focused questions |
+| **Graph-traversal** | Graph BFS with path finding | Relationship questions |
+
+**Smart Mode** automatically combines:
+- Chunk embeddings (semantic foundation)
+- Entity embeddings (entity discovery)
+- Relationship embeddings (relationship enhancement)
+- Keyword extraction (precision boosting)
 
 ### Detail Levels
 
@@ -197,13 +204,16 @@ curl http://localhost:8013/health
 | [KG_RAG_USER_MANUAL.md](KG_RAG_USER_MANUAL.md) | Complete user guide |
 | [CONFIGURATION_GUIDE.md](CONFIGURATION_GUIDE.md) | Configuration reference |
 | [STARTUP_GUIDE.md](STARTUP_GUIDE.md) | Startup process details |
+| [SEARCH_MODES_IMPLEMENTATION.md](SEARCH_MODES_IMPLEMENTATION.md) | Search modes implementation details |
+| [docs/SEARCH_MODES_SUMMARY.md](docs/SEARCH_MODES_SUMMARY.md) | Search modes user guide |
+| [CHANGELOG.md](CHANGELOG.md) | All system changes |
 | `backend/docs/` | Backend technical docs |
 | `frontend/README.md` | Frontend documentation |
 
 ## 📝 Version History
 
-- **v1.4-beta**: Enhanced startup script, DB Management API auto-restart, font size improvements
-- **v1.2-beta**: Combined v1.0 backend + v1.1 frontend
+- **v2.0-beta**: Enhanced startup script, DB Management API auto-restart, font size improvements
+- **v2.0-beta**: Combined v1.0 backend + v1.1 frontend
 - **v1.1-beta**: Vite + TypeScript frontend
 - **v1.0-beta**: Original pgvector backend
 

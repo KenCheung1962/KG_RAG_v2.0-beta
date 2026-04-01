@@ -49,12 +49,12 @@ Styled with:
 ### Step 1: Update Frontend (QueryTab.ts)
 
 Replace the `formatQueryResponse` function with the improved version from:
-`/Users/ken/clawd_workspace/projects/KG_RAG/v1.2-beta/frontend/src/components/tabs/QueryTab_improved.ts`
+`/Users/ken/clawd_workspace/projects/KG_RAG/v2.0-beta/frontend/src/components/tabs/QueryTab_improved.ts`
 
 ### Step 2: Update Backend (query.js)
 
 Replace the `formatMarkdownToHtml` function with the improved version from:
-`/Users/ken/clawd_workspace/projects/KG_RAG/v1.2-beta/backend/js/query_improved.js`
+`/Users/ken/clawd_workspace/projects/KG_RAG/v2.0-beta/backend/js/query_improved.js`
 
 ### Step 3: Add CSS Styles
 

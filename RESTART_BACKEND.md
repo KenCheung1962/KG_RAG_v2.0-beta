@@ -22,7 +22,7 @@ kill -9 <PID>
 
 ### Step 2: Start New Backend
 ```bash
-cd /Users/ken/clawd_workspace/projects/KG_RAG/v1.2-beta/backend
+cd /Users/ken/clawd_workspace/projects/KG_RAG/v2.0-beta/backend
 python pgvector_api.py
 ```
 
@@ -59,7 +59,7 @@ If you see `sources type: number`, the backend hasn't been restarted yet.
 The start.sh script will automatically start the new backend:
 
 ```bash
-cd /Users/ken/clawd_workspace/projects/KG_RAG/v1.2-beta
+cd /Users/ken/clawd_workspace/projects/KG_RAG/v2.0-beta
 ./start.sh
 ```
 

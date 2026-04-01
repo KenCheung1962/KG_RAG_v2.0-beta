@@ -56,6 +56,27 @@ async function getExistingDocs() {
 }
 
 /**
+ * Get LLM configuration from localStorage (set by Config Tab)
+ * @returns {Object} LLM provider configuration
+ */
+function getLLMConfigFromStorage() {
+    try {
+        const stored = localStorage.getItem('kg_rag_llm_config');
+        if (stored) {
+            const config = JSON.parse(stored);
+            return {
+                provider: config.entityExtraction?.primary || 'deepseek',
+                fallback_provider: config.entityExtraction?.fallback || null
+            };
+        }
+    } catch(e) {
+        console.log('Could not read LLM config:', e);
+    }
+    // Default config
+    return { provider: 'deepseek', fallback_provider: null };
+}
+
+/**
  * Upload a document to the server
  * @param {File} file - File to upload
  * @returns {Promise<Object>} Upload result
@@ -71,13 +92,17 @@ async function uploadDocument(file) {
         base64 = btoa(content);
     }
     
+    // Get LLM configuration from Config Tab settings
+    const llmConfig = getLLMConfigFromStorage();
+    
     const response = await fetch(`${API_URL}/api/v1/documents/upload/json`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
             content: base64,
             id: file.name,
-            content_type: 'text/plain'
+            content_type: 'text/plain',
+            llm_config: llmConfig
         })
     });
     

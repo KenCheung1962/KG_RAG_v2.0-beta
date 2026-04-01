@@ -1,1 +1,1 @@
-v1.2-beta - Combined Backend + Frontend
+v2.0-beta - Combined Backend + Frontend

@@ -93,7 +93,7 @@ Does content contain 2+ critical technical terms?
 
 ```bash
 kill $(lsof -t -i:8002)
-cd /Users/ken/clawd_workspace/projects/KG_RAG/v1.2-beta/backend
+cd /Users/ken/clawd_workspace/projects/KG_RAG/v2.0-beta/backend
 python pgvector_api.py
 ```
 

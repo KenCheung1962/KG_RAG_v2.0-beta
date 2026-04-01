@@ -56,7 +56,7 @@ Packaging doc content: "Hybrid bonding is used in advanced packaging for HBM..."
 
 ## Files Modified
 
-- `/v1.2-beta/backend/pgvector_api.py`
+- `/v2.0-beta/backend/pgvector_api.py`
   - Updated `is_chunk_content_relevant()` function
   - Changed min_matches from 2 to 3
   - Added domain-specific critical terms
@@ -74,7 +74,7 @@ kill $(lsof -t -i:8002)
 lsof -i :8002
 
 # 3. Start updated backend
-cd /Users/ken/clawd_workspace/projects/KG_RAG/v1.2-beta/backend
+cd /Users/ken/clawd_workspace/projects/KG_RAG/v2.0-beta/backend
 python pgvector_api.py
 ```
 

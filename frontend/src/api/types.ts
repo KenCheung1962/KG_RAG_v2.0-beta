@@ -46,7 +46,7 @@ export interface QueryRequest {
   detailed?: boolean;
   /** Enable ultra-comprehensive mode (3000-4000 words) */
   ultra_comprehensive?: boolean;
-  /** Rerank method: hybrid, vector, keyword, none */
+  /** Rerank method: semantic, vector, keyword, none */
   rerank?: boolean;
   rerank_method?: string;
   /** LLM provider configuration */

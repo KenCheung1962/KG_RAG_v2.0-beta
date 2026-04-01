@@ -1,12 +1,12 @@
 #!/bin/bash
-# KG RAG System v1.2-beta Startup Script
+# KG RAG System v2.0-beta Startup Script
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "========================================="
-echo "  KG RAG System v1.2-beta"
+echo "  KG RAG System v2.0-beta"
 echo "========================================="
 echo ""
 
