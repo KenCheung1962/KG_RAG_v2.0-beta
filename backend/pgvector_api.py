@@ -35,7 +35,6 @@ except ImportError:
         PDF_SUPPORT = False
         print("[WARNING] PyPDF2/pypdf not installed. PDF text extraction will not work.")
 
-sys.path.insert(0, '/Users/ken/clawd_workspace/projects/KG_RAG/proj_ph2/source/postgres')
 
 # Import LLM provider functions for configurable entity extraction
 try:
