@@ -2,7 +2,7 @@
  * Query Tab Component
  */
 
-import { sendQuery } from '@/api';
+import { sendQuery, sendQueryStreaming, type StreamingEvent } from '@/api';
 import type { QueryMode } from '@/config';
 import { getElement, setVisible, setDisabled } from '@/utils/dom';
 import { escapeHtml } from '@/utils/helpers';
@@ -601,6 +601,7 @@ async function handleRunQuery(): Promise<void> {
   
   setIsQuerying(true);
   setDisabled('runQueryBtn', true);
+  if (runBtn) runBtn.classList.add('blinking');  // Add blinking effect during search
   if (printBtn) printBtn.style.display = 'none';
   
   // Update button text based on mode
@@ -645,145 +646,215 @@ async function handleRunQuery(): Promise<void> {
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   
   try {
-    const result = await sendQuery({ 
-      message: queryText, 
-      mode,
-      top_k: detail.top_k,
-      ultra_comprehensive: detail.ultra_comprehensive,
-      detailed: detail.detailed
-    }, controller.signal);
-    clearTimeout(timeoutId);
-    
-    const responseText = result.response || result.answer || JSON.stringify(result, null, 2);
-    
-    // Debug: log full result to see what fields are returned
-    console.log('[Query] Full result:', result);
-    console.log('[Query] Result keys:', Object.keys(result));
-    
-    // Store sources and build answer with references for printing
-    // Check multiple possible source field names
-    const sources = result.sources || result.source_documents || (result as Record<string, unknown>).source || (result as Record<string, unknown>).chunks;
-    console.log('[Query] Raw sources:', sources);
-    console.log('[Query] sources type:', typeof sources);
-    console.log('[Query] sources isArray:', Array.isArray(sources));
-    
-    // TEMPORARY: If backend returns number instead of array, log the issue
-    if (typeof sources === 'number') {
-      console.warn('[Query] Backend returned source COUNT instead of source filenames. References cannot be displayed.');
-    }
-    if (Array.isArray(sources)) {
-      // Handle both string array and object array
-      lastSources = sources.map((s: unknown): string => {
-        if (typeof s === 'string') return s;
-        // If source is an object with filename or doc_id, extract it
-        if (s && typeof s === 'object') {
-          return ((s as Record<string, unknown>).filename as string) || 
-                 ((s as Record<string, unknown>).doc_id as string) || 
-                 ((s as Record<string, unknown>).name as string) || 
-                 JSON.stringify(s);
-        }
-        return String(s);
-      });
-    } else {
-      lastSources = [];
-    }
-    console.log('[Query] Processed sources:', lastSources);
-    
-    // Extract which sources are actually CITED in the response text
-    const citedSourceNumbers = new Set<number>();
-    const sourceCitations = responseText.match(/Source\s+(\d+)/gi);
-    if (sourceCitations) {
-      sourceCitations.forEach(citation => {
-        const match = citation.match(/\d+/);
-        if (match) {
-          citedSourceNumbers.add(parseInt(match[0], 10));
-        }
-      });
-    }
-    console.log('[Query] Sources cited in text:', Array.from(citedSourceNumbers));
-    
-    // Build answer with reference section for print output
-    // ONLY include references that are actually CITED in the text
-    let answerWithRefs = responseText;
-    if (citedSourceNumbers.size > 0 && lastSources.length > 0) {
-      // Filter to only cited sources
-      const citedSources = Array.from(citedSourceNumbers)
-        .sort((a, b) => a - b)
-        .map(num => lastSources[num - 1])  // Source 1 = index 0
-        .filter(src => src !== undefined);  // Remove undefined
+    // Use streaming for Ultra/Comprehensive modes, regular for Quick/Balanced
+    if (isUltra || isComprehensive) {
+      // ========== STREAMING MODE ==========
+      let accumulatedContent = '';
+      let currentProgress = 0;
+      let sectionsCompleted = 0;
       
-      if (citedSources.length > 0) {
-        answerWithRefs += '\n\n\n## References\n\n';
-        citedSources.forEach((src, idx) => {
-          answerWithRefs += `${idx + 1}. ${src}\n`;
+      await sendQueryStreaming(
+        {
+          message: queryText,
+          mode,
+          top_k: detail.top_k,
+          ultra_comprehensive: detail.ultra_comprehensive,
+          detailed: detail.detailed
+        },
+        (event: StreamingEvent) => {
+          switch (event.type) {
+            case 'status':
+              // Update progress message
+              currentProgress = event.progress || currentProgress;
+              answerText!.innerHTML = `
+                <div class="streaming-status">
+                  <div class="progress-bar">
+                    <div class="progress-fill" style="width: ${currentProgress}%"></div>
+                  </div>
+                  <div class="status-message">
+                    <span class="spinner"></span>
+                    <strong>${event.message}</strong> (${currentProgress}%)
+                  </div>
+                </div>
+                ${accumulatedContent ? '<div class="partial-content">' + formatQueryResponse(accumulatedContent) + '</div>' : ''}
+              `;
+              break;
+              
+            case 'content':
+              // Append new content section
+              if (event.content) {
+                accumulatedContent += '\n\n' + event.content;
+                sectionsCompleted++;
+                currentProgress = event.progress || currentProgress;
+                
+                // Update display with partial content
+                answerText!.innerHTML = `
+                  <div class="streaming-status">
+                    <div class="progress-bar">
+                      <div class="progress-fill" style="width: ${currentProgress}%"></div>
+                    </div>
+                    <div class="status-message">
+                      <span class="spinner"></span>
+                      <strong>Generated: ${event.section_title || event.section}</strong> (${currentProgress}%)
+                    </div>
+                  </div>
+                  <div class="partial-content">${formatQueryResponse(accumulatedContent)}</div>
+                `;
+                
+                // Scroll to bottom to show new content
+                answerText!.scrollTop = answerText!.scrollHeight;
+              }
+              break;
+              
+            case 'complete':
+              // Final content received
+              if (event.content) {
+                accumulatedContent = event.content;
+                lastAnswerText = accumulatedContent;
+                
+                // Format and display final content
+                answerText!.innerHTML = formatQueryResponse(accumulatedContent);
+                
+                // Show completion stats
+                const wordCount = event.word_count || accumulatedContent.split(/\s+/).length;
+                sourcesText!.innerHTML = `
+                  <div class="completion-stats">
+                    ✅ <strong>Generation Complete</strong><br>
+                    Word count: ~${wordCount} words<br>
+                    Mode: ${detail.label}
+                  </div>
+                `;
+              }
+              break;
+              
+            case 'error':
+              throw new Error(event.error || 'Streaming error occurred');
+          }
+        },
+        controller.signal
+      );
+      
+      clearTimeout(timeoutId);
+      if (printBtn) printBtn.style.display = 'inline-block';
+      
+    } else {
+      // ========== NON-STREAMING MODE (Quick/Balanced) ==========
+      const result = await sendQuery({ 
+        message: queryText, 
+        mode,
+        top_k: detail.top_k,
+        ultra_comprehensive: detail.ultra_comprehensive,
+        detailed: detail.detailed
+      }, controller.signal);
+      clearTimeout(timeoutId);
+      
+      const responseText = result.response || result.answer || JSON.stringify(result, null, 2);
+      
+      // Debug: log full result to see what fields are returned
+      console.log('[Query] Full result:', result);
+      console.log('[Query] Result keys:', Object.keys(result));
+      
+      // Store sources and build answer with references for printing
+      const sources = result.sources || result.source_documents || (result as Record<string, unknown>).source || (result as Record<string, unknown>).chunks;
+      if (Array.isArray(sources)) {
+        lastSources = sources.map((s: unknown): string => {
+          if (typeof s === 'string') return s;
+          if (s && typeof s === 'object') {
+            return ((s as Record<string, unknown>).filename as string) || 
+                   ((s as Record<string, unknown>).doc_id as string) || 
+                   ((s as Record<string, unknown>).name as string) || 
+                   JSON.stringify(s);
+          }
+          return String(s);
+        });
+      } else {
+        lastSources = [];
+      }
+      
+      // Extract cited sources
+      const citedSourceNumbers = new Set<number>();
+      const sourceCitations = responseText.match(/Source\s+(\d+)/gi);
+      if (sourceCitations) {
+        sourceCitations.forEach(citation => {
+          const match = citation.match(/\d+/);
+          if (match) {
+            citedSourceNumbers.add(parseInt(match[0], 10));
+          }
         });
       }
-    }
-    // Note removed - response shown as-is from backend
-    lastAnswerText = answerWithRefs;
-    
-    if (printBtn) printBtn.style.display = 'inline-block';
-    
-    // Check if LLM timed out
-    if (responseText.startsWith('Found') && responseText.includes('relevant chunks')) {
-      renderTimeoutResponse(responseText, answerText!);
-    } else {
-      // Format the response with improved styling - include ONLY cited references
-      let displayText = responseText;
+      
+      // Build answer with references
+      let answerWithRefs = responseText;
       if (citedSourceNumbers.size > 0 && lastSources.length > 0) {
-        // Filter to only cited sources
         const citedSources = Array.from(citedSourceNumbers)
           .sort((a, b) => a - b)
           .map(num => lastSources[num - 1])
           .filter(src => src !== undefined);
         
         if (citedSources.length > 0) {
-          displayText += '\n\n\n## References\n\n' + citedSources.map((src, idx) => `${idx + 1}. ${src}`).join('\n');
-        }
-      }
-      // Note removed - response shown as-is from backend
-      answerText!.innerHTML = formatQueryResponse(displayText);
-      
-      // Render math formulas using KaTeX
-      setTimeout(() => renderMathInElement(answerText!), 100);
-    }
-    
-    // Show sources with dual sections (📚 References + 🔍 Sources for Verification)
-    const rawSources = result.sources || result.source_documents;
-    if (lastSources.length > 0) {
-      // Build structured sources display with 📚 References and 🔍 Sources sections
-      let sourcesHtml = '';
-      
-      // 📚 References section (Green) - only cited sources
-      if (citedSourceNumbers.size > 0) {
-        const citedSources = Array.from(citedSourceNumbers)
-          .sort((a, b) => a - b)
-          .map(num => lastSources[num - 1])
-          .filter(src => src !== undefined);
-        
-        if (citedSources.length > 0) {
-          sourcesHtml += `<div class="sources-section references-section">`;
-          sourcesHtml += `<div class="sources-header references-header">📚 References</div>`;
+          answerWithRefs += '\n\n\n## References\n\n';
           citedSources.forEach((src, idx) => {
-            sourcesHtml += `<div class="source-item references-item">${idx + 1}. ${escapeHtml(src)}</div>`;
+            answerWithRefs += `${idx + 1}. ${src}\n`;
           });
-          sourcesHtml += `</div>`;
         }
       }
+      lastAnswerText = answerWithRefs;
       
-      // 🔍 Sources (for Verification) section (Orange) - all sources
-      sourcesHtml += `<div class="sources-section verification-section">`;
-      sourcesHtml += `<div class="sources-header verification-header">🔍 Sources (for Verification)</div>`;
-      lastSources.forEach((src, idx) => {
-        sourcesHtml += `<div class="source-item verification-item">${idx + 1}. ${escapeHtml(src)}</div>`;
-      });
-      sourcesHtml += `</div>`;
+      if (printBtn) printBtn.style.display = 'inline-block';
       
-      sourcesText!.innerHTML = sourcesHtml;
-    } else if (typeof rawSources === 'number') {
-      sourcesText!.innerHTML = `<div class="source-item">Found ${rawSources} sources (filenames not available - backend config issue)</div>`;
-    } else {
-      sourcesText!.textContent = 'No sources available';
+      // Check if LLM timed out
+      if (responseText.startsWith('Found') && responseText.includes('relevant chunks')) {
+        renderTimeoutResponse(responseText, answerText!);
+      } else {
+        let displayText = responseText;
+        if (citedSourceNumbers.size > 0 && lastSources.length > 0) {
+          const citedSources = Array.from(citedSourceNumbers)
+            .sort((a, b) => a - b)
+            .map(num => lastSources[num - 1])
+            .filter(src => src !== undefined);
+          
+          if (citedSources.length > 0) {
+            displayText += '\n\n\n## References\n\n' + citedSources.map((src, idx) => `${idx + 1}. ${src}`).join('\n');
+          }
+        }
+        answerText!.innerHTML = formatQueryResponse(displayText);
+        setTimeout(() => renderMathInElement(answerText!), 100);
+      }
+      
+      // Show sources
+      const rawSources = result.sources || result.source_documents;
+      if (lastSources.length > 0) {
+        let sourcesHtml = '';
+        
+        if (citedSourceNumbers.size > 0) {
+          const citedSources = Array.from(citedSourceNumbers)
+            .sort((a, b) => a - b)
+            .map(num => lastSources[num - 1])
+            .filter(src => src !== undefined);
+          
+          if (citedSources.length > 0) {
+            sourcesHtml += `<div class="sources-section references-section">`;
+            sourcesHtml += `<div class="sources-header references-header">📚 References</div>`;
+            citedSources.forEach((src, idx) => {
+              sourcesHtml += `<div class="source-item references-item">${idx + 1}. ${escapeHtml(src)}</div>`;
+            });
+            sourcesHtml += `</div>`;
+          }
+        }
+        
+        sourcesHtml += `<div class="sources-section verification-section">`;
+        sourcesHtml += `<div class="sources-header verification-header">🔍 Sources (for Verification)</div>`;
+        lastSources.forEach((src, idx) => {
+          sourcesHtml += `<div class="source-item verification-item">${idx + 1}. ${escapeHtml(src)}</div>`;
+        });
+        sourcesHtml += `</div>`;
+        
+        sourcesText!.innerHTML = sourcesHtml;
+      } else if (typeof rawSources === 'number') {
+        sourcesText!.innerHTML = `<div class="source-item">Found ${rawSources} sources (filenames not available)</div>`;
+      } else {
+        sourcesText!.textContent = 'No sources available';
+      }
     }
     
   } catch (error) {
@@ -793,7 +864,10 @@ async function handleRunQuery(): Promise<void> {
     setIsQuerying(false);
     setActiveQueryController(null);
     setDisabled('runQueryBtn', false);
-    if (runBtn) runBtn.textContent = '🔍 Ask Question';
+    if (runBtn) {
+      runBtn.textContent = '🔍 Ask Question';
+      runBtn.classList.remove('blinking');
+    }
   }
 }
 

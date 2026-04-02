@@ -21,7 +21,7 @@ import httpx
 # Load timeout configuration
 # NO TRUNCATION: Increased timeouts to support long-form content generation
 EMBEDDING_TIMEOUT = float(os.getenv("EMBEDDING_TIMEOUT", "120"))
-LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "600"))  # 10 min for NO TRUNCATION - Ultra mode needs more time for multi-step generation
+LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "900"))  # 15 min for NO TRUNCATION - Ultra mode needs more time for multi-step generation
 
 print(f"[minimax.py] Timeout Configuration: EMBEDDING_TIMEOUT={EMBEDDING_TIMEOUT}s, LLM_TIMEOUT={LLM_TIMEOUT}s")
 

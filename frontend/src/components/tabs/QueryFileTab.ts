@@ -841,6 +841,8 @@ async function handleRunQueryWithFile(): Promise<void> {
   setIsQuerying(true);
   const answerDiv = getElement('queryFileAnswer');
   const exportBtn = getElement('exportQueryFilePdfBtn') as HTMLButtonElement | null;
+  const runBtn = getElement('runQueryFileBtn');
+  if (runBtn) runBtn.classList.add('blinking');  // Add blinking effect during search
   
   console.log('[QueryFile] Starting query, exportBtn:', exportBtn);
   
@@ -1112,6 +1114,8 @@ async function handleRunQueryWithFile(): Promise<void> {
     }
   } finally {
     setIsQuerying(false);
+    const runBtn = getElement('runQueryFileBtn');
+    if (runBtn) runBtn.classList.remove('blinking');  // Remove blinking effect when search completes
   }
 }
 

@@ -357,6 +357,176 @@ export async function sendQueryWithFiles(
   return resp.json();
 }
 
+// ============ Streaming Query Functions (Step-by-Step Display) ============
+
+export interface StreamingEvent {
+  type: 'status' | 'content' | 'complete' | 'error';
+  stage?: string;
+  message?: string;
+  progress?: number;
+  section?: string;
+  section_title?: string;
+  content?: string;
+  word_count?: number;
+  sections_generated?: number;
+  error?: string;
+}
+
+export async function sendQueryStreaming(
+  request: QueryRequest,
+  onEvent: (event: StreamingEvent) => void,
+  signal?: AbortSignal
+): Promise<void> {
+  const isUltra = request.ultra_comprehensive;
+  const isComprehensive = request.detailed;
+  
+  // Only use streaming for Ultra/Comprehensive modes
+  if (!isUltra && !isComprehensive) {
+    throw new Error('Streaming is only supported for Ultra-Deep and Comprehensive modes');
+  }
+  
+  const llmConfig = getLLMConfig();
+  const providerConfig: LLMProviderConfig = {
+    provider: llmConfig.responseGeneration.primary,
+    fallback_provider: llmConfig.responseGeneration.fallback
+  };
+  
+  const enhancedRequest = {
+    ...request,
+    top_k: request.top_k ?? 20,
+    llm_config: providerConfig
+  };
+  
+  const resp = await fetch(buildUrl('/api/v1/chat/stream'), {
+    method: 'POST',
+    headers: { 
+      'Content-Type': 'application/json',
+      'X-API-Key': API_KEY 
+    },
+    body: JSON.stringify(enhancedRequest),
+    signal
+  });
+  
+  if (!resp.ok) throw new Error(`Streaming query failed: ${resp.status}`);
+  if (!resp.body) throw new Error('No response body');
+  
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    
+    buffer += decoder.decode(value, { stream: true });
+    
+    // Process complete lines
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || ''; // Keep incomplete line in buffer
+    
+    for (const line of lines) {
+      if (line.trim()) {
+        try {
+          const event: StreamingEvent = JSON.parse(line);
+          onEvent(event);
+          
+          if (event.type === 'complete' || event.type === 'error') {
+            return;
+          }
+        } catch (e) {
+          console.warn('Failed to parse streaming event:', line, e);
+        }
+      }
+    }
+  }
+  
+  // Process any remaining data
+  if (buffer.trim()) {
+    try {
+      const event: StreamingEvent = JSON.parse(buffer);
+      onEvent(event);
+    } catch (e) {
+      console.warn('Failed to parse final streaming event:', buffer, e);
+    }
+  }
+}
+
+export async function sendQueryWithFilesStreaming(
+  request: QueryWithFilesRequest,
+  onEvent: (event: StreamingEvent) => void,
+  signal?: AbortSignal
+): Promise<void> {
+  const isUltra = request.ultra_comprehensive;
+  const isComprehensive = request.detailed;
+  
+  if (!isUltra && !isComprehensive) {
+    throw new Error('Streaming is only supported for Ultra-Deep and Comprehensive modes');
+  }
+  
+  const llmConfig = getLLMConfig();
+  const providerConfig: LLMProviderConfig = {
+    provider: llmConfig.responseGenerationWithFile.primary,
+    fallback_provider: llmConfig.responseGenerationWithFile.fallback
+  };
+  
+  const enhancedRequest = {
+    ...request,
+    top_k: request.top_k ?? 20,
+    llm_config: providerConfig
+  };
+  
+  const resp = await fetch(buildUrl('/api/v1/chat/with-doc/stream'), {
+    method: 'POST',
+    headers: { 
+      'Content-Type': 'application/json',
+      'X-API-Key': API_KEY 
+    },
+    body: JSON.stringify(enhancedRequest),
+    signal
+  });
+  
+  if (!resp.ok) throw new Error(`Streaming query with files failed: ${resp.status}`);
+  if (!resp.body) throw new Error('No response body');
+  
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    
+    buffer += decoder.decode(value, { stream: true });
+    
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    
+    for (const line of lines) {
+      if (line.trim()) {
+        try {
+          const event: StreamingEvent = JSON.parse(line);
+          onEvent(event);
+          
+          if (event.type === 'complete' || event.type === 'error') {
+            return;
+          }
+        } catch (e) {
+          console.warn('Failed to parse streaming event:', line, e);
+        }
+      }
+    }
+  }
+  
+  if (buffer.trim()) {
+    try {
+      const event: StreamingEvent = JSON.parse(buffer);
+      onEvent(event);
+    } catch (e) {
+      console.warn('Failed to parse final streaming event:', buffer, e);
+    }
+  }
+}
+
 export async function uploadFolder(
   request: FolderUploadRequest
 ): Promise<FolderUploadResult> {

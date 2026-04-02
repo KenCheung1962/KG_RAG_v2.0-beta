@@ -13,9 +13,9 @@ import logging
 from datetime import datetime
 from fastapi import Request, FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict
 import sys
 import time
 import re
@@ -72,6 +72,9 @@ RERANK_CONFIG = RerankConfig()
 # =============================================================================
 
 rerank_logger = logging.getLogger("reranker")
+
+# Generic logger for general logging
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # EMBEDDING FUNCTION (Ollama - nomic-embed-text)
@@ -1753,7 +1756,8 @@ Output format:
         sec_end = h2_matches[i + 1].start() if i + 1 < len(h2_matches) else len(outline)
         for h3 in h3_matches:
             if sec_start <= h3.start() < sec_end:
-                sub_title = re.sub(r'^\d+\.\d+\s+', '', h3.group(1).strip())
+                # Strip any numbering like "1.1", "2.1", "1.", "2." from the beginning
+                sub_title = re.sub(r'^\d+(\.\d+)?[\.\s]+', '', h3.group(1).strip())
                 subsections.append(sub_title)
         while len(subsections) < num_subsections:
             subsections.append(f"Subsection {i+1}.{len(subsections)+1}")
@@ -4813,6 +4817,405 @@ async def chat_with_doc(request: dict):
             "sources": source_list,  # Return actual filenames
             "confidence": 0.5
         }
+
+# ============ Streaming Chat Endpoints ============
+
+@app.post("/api/v1/chat/stream")
+async def chat_stream(request: dict):
+    """
+    Streaming version of chat endpoint for Ultra-Deep and Comprehensive modes.
+    """
+    query = request.get("query") or request.get("message", "")
+    mode = request.get("mode", "semantic").lower()
+    llm_config = request.get("llm_config", {})
+    
+    is_ultra = request.get("ultra_comprehensive", False)
+    is_comprehensive = request.get("detailed", False) or mode == "comprehensive"
+    
+    if not (is_ultra or is_comprehensive):
+        return JSONResponse({
+            "error": "Streaming is only supported for Ultra-Deep and Comprehensive modes"
+        }, status_code=400)
+    
+    if not query or not query.strip():
+        return JSONResponse({
+            "error": "Please enter a question to search the knowledge base."
+        }, status_code=400)
+    
+    # Use semantic search with STRICT threshold (0.5)
+    query_embedding = get_ollama_embedding(query)
+    top_k = 30 if is_ultra else 20
+    
+    result = []
+    try:
+        from storage import DistanceMetric
+        chunk_results = await storage.search_chunks(
+            query_vector=query_embedding,
+            limit=top_k,
+            distance_metric=DistanceMetric.COSINE,
+            match_threshold=0.5  # STRICT: Search threshold 0.5
+        )
+        for chunk in chunk_results:
+            result.append({
+                'id': chunk.chunk_id,
+                'content': chunk.content,
+                'source': chunk.source,
+                'similarity': chunk.similarity
+            })
+    except Exception as e:
+        rerank_logger.error(f"[chat_stream] Search failed: {e}")
+    
+    # STRICT FILTERING: Only keep sources with similarity >= 0.7
+    similarity_threshold = 0.7
+    min_quality_sources = 5
+    
+    # Build sources list with deduplication and strict filtering
+    sources = []
+    seen_sources = set()
+    for r in result:
+        source_name = r.get('source', 'unknown')
+        similarity = r.get('similarity', 0.5)
+        
+        # Skip duplicates
+        if source_name in seen_sources:
+            continue
+        
+        # STRICT: Only keep high-quality sources (>= 0.7)
+        if similarity < similarity_threshold:
+            continue
+            
+        seen_sources.add(source_name)
+        sources.append({
+            'source': source_name,
+            'content': r.get('content', ''),
+            'similarity': similarity
+        })
+        if len(sources) >= 15:
+            break
+    
+    # LLM KNOWLEDGE FALLBACK: If fewer than 5 high-quality sources
+    use_llm_references = len(sources) < min_quality_sources
+    
+    context_parts = [f"Source {i+1} ({s['source']}): {s['content']}" for i, s in enumerate(sources)]
+    context = "\n\n".join(context_parts)
+    
+    async def event_generator():
+        async for chunk in generate_ultra_response_streaming(
+            query=query,
+            context=context,
+            base_system_prompt="You are a senior research scientist writing academic survey papers.",
+            target_words=">2500-3500" if is_ultra else ">1800-2500",
+            num_sections=7 if is_ultra else 5,
+            num_subsections=3,
+            llm_config=llm_config,
+            sources=sources,
+            use_llm_references=use_llm_references
+        ):
+            yield chunk
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="application/x-ndjson",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
+    )
+
+
+async def generate_ultra_response_streaming(
+    query: str,
+    context: str,
+    base_system_prompt: str,
+    target_words: str,
+    num_sections: int = 5,
+    num_subsections: int = 3,
+    llm_config: dict = None,
+    chinese_variant: str = "english",
+    sources: list = None,
+    use_llm_references: bool = False
+):
+    """Streaming version of Ultra-Deep generation."""
+    if llm_config is None:
+        llm_config = {}
+    provider = llm_config.get("provider", "deepseek")
+    fallback = llm_config.get("fallback_provider")
+    
+    # Language setup
+    if chinese_variant == "traditional":
+        exec_summary_label = "摘要"
+        conclusion_label = "結論"
+        references_label = "參考文獻"
+        lang_instr = "使用繁體中文撰寫"
+    elif chinese_variant == "simplified":
+        exec_summary_label = "摘要"
+        conclusion_label = "结论"
+        references_label = "参考文献"
+        lang_instr = "使用简体中文撰写"
+    else:
+        exec_summary_label = "Executive Summary"
+        conclusion_label = "Conclusion"
+        references_label = "References"
+        lang_instr = "Write in English"
+    
+    source_list = "\n".join([f"[{i+1}] {s.get('source', f'Doc {i+1}')}" for i, s in enumerate(sources[:15])]) if sources else "[1] Knowledge Base Sources"
+    
+    yield json.dumps({"type": "status", "stage": "outline", "message": "Creating outline...", "progress": 0}) + "\n"
+    
+    # Generate outline
+    outline_prompt = f"""Create a detailed outline for: {query}
+
+Requirements:
+- {num_sections} major sections
+- Each section has {num_subsections} subsections
+- Format sections as: 1, 2, 3, etc.
+- Format subsections as: 1.1, 1.2, 1.3, 2.1, 2.2, 2.3, etc.
+
+CRITICAL: In the <query-h3> tags, ONLY put the subsection TITLE - DO NOT include the number prefix like "1.1" or "2.1". The system will add the numbers automatically.
+
+CORRECT: <query-h3>Explanation of HBM Technology</query-h3>
+WRONG: <query-h3>1.1 Explanation of HBM Technology</query-h3>"""
+
+    try:
+        outline = await llm_complete_with_provider(
+            prompt=outline_prompt,
+            system_prompt=f"Create outlines using ONLY <query-h1>, <query-h2>, <query-h3> tags. {lang_instr}",
+            provider=provider,
+            fallback_provider=fallback,
+            max_tokens=2000,
+            temperature=0.3
+        )
+    except Exception as e:
+        outline = ""
+    
+    # Parse outline
+    import re
+    sections = []
+    h2_matches = list(re.finditer(r'<query-h2>(.*?)</query-h2>', outline, re.DOTALL))
+    h3_matches = list(re.finditer(r'<query-h3>(.*?)</query-h3>', outline, re.DOTALL))
+    
+    for i, h2 in enumerate(h2_matches[:num_sections]):
+        title = re.sub(r'^\d+[\.\s]+', '', h2.group(1).strip())
+        subsections = []
+        sec_start = h2.end()
+        sec_end = h2_matches[i + 1].start() if i + 1 < len(h2_matches) else len(outline)
+        for h3 in h3_matches:
+            if sec_start <= h3.start() < sec_end:
+                sub_title = re.sub(r'^\d+\.\d+\s+', '', h3.group(1).strip())
+                subsections.append(sub_title)
+        while len(subsections) < num_subsections:
+            subsections.append(f"Subsection {i+1}.{len(subsections)+1}")
+        sections.append({'title': title, 'subsections': subsections[:num_subsections]})
+    
+    defaults = ["Fundamental Concepts", "Core Mechanisms", "Advanced Techniques", "Applications", "Future Directions"]
+    while len(sections) < num_sections:
+        i = len(sections)
+        sections.append({
+            'title': defaults[i] if i < len(defaults) else f"Section {i+1}",
+            'subsections': [f"Theory", "Implementation", "Analysis"]
+        })
+    
+    # Title
+    yield json.dumps({"type": "content", "section": "title", "content": f"<query-h1>{query}</query-h1>", "progress": 5}) + "\n"
+    full_content_parts = [f"<query-h1>{query}</query-h1>"]
+    
+    # Executive Summary
+    yield json.dumps({"type": "status", "stage": "executive_summary", "message": "Generating Executive Summary...", "progress": 10}) + "\n"
+    
+    exec_prompt = f"""Write an Executive Summary for: {query}
+
+AVAILABLE SOURCES FOR CITATION:
+{source_list}
+
+CITATION REQUIREMENTS - CRITICAL:
+1. Use EXACT format: <span class="citation-ref">[N]</span>
+2. Cite at least 8+ DIFFERENT sources like [1], [2], [3], [4], [5], [6], [7], [8]
+3. VARY between sources - do NOT use [1] repeatedly
+
+CORRECT (VARIED citations):
+"Research shows management affects outcomes <span class="citation-ref">[1]</span>. Studies indicate motivation drives engagement <span class="citation-ref">[3]</span>. Participation reinforces learning <span class="citation-ref">[5]</span>."
+
+WRONG (REPEATING [1]):
+"Research shows management <span class="citation-ref">[1]</span>. Motivation drives engagement <span class="citation-ref">[1]</span>. Participation <span class="citation-ref">[1]</span>."
+
+Requirements:
+- 300+ words
+- Use <query-h2>{exec_summary_label}</query-h2>
+- Cite at least 8+ DIFFERENT sources - vary between [1] through [12]
+- Flowing paragraphs only, no bullet points"""
+
+    try:
+        exec_summary = await llm_complete_with_provider(
+            prompt=exec_prompt,
+            system_prompt=f"Write comprehensive content. Use ONLY HTML tags. {lang_instr}",
+            provider=provider,
+            fallback_provider=fallback,
+            max_tokens=4000,
+            temperature=0.3
+        )
+        full_content_parts.append(exec_summary)
+        yield json.dumps({"type": "content", "section": "executive_summary", "content": exec_summary, "progress": 15}) + "\n"
+    except Exception as e:
+        exec_summary = f"<query-h2>{exec_summary_label}</query-h2>\n\n[Executive Summary pending...]"
+        full_content_parts.append(exec_summary)
+    
+    # Generate sections
+    total_sections = len(sections)
+    for idx, section in enumerate(sections, 1):
+        progress = 15 + (idx / total_sections) * 70
+        yield json.dumps({"type": "status", "stage": f"section_{idx}", "message": f"Generating Section {idx}...", "progress": int(progress)}) + "\n"
+        
+        batch_prompt = f"""Write Section {idx} for: {query}
+
+Section: {idx}. {section['title']}
+Subsection TITLES (DO NOT include numbers like "{idx}.1" in the title text):
+{chr(10).join(['- ' + s for s in section['subsections'][:num_subsections]])}
+
+AVAILABLE SOURCES FOR CITATION:
+{source_list}
+
+CITATION REQUIREMENTS - CRITICAL:
+1. Use EXACT format: <span class="citation-ref">[N]</span>
+2. Include 3-5 citations from DIFFERENT sources per subsection
+3. VARY between sources [1] through [8] and beyond - do NOT repeat [1]
+
+CORRECT (VARIED):
+"Research shows... <span class="citation-ref">[1]</span>. Further studies indicate... <span class="citation-ref">[3]</span>. Additional evidence... <span class="citation-ref">[5]</span>."
+
+WRONG (REPEATING):
+"Research shows... <span class="citation-ref">[1]</span>. Further studies... <span class="citation-ref">[1]</span>. Additional... <span class="citation-ref">[1]</span>."
+
+Write using EXACT format:
+<query-h2>{idx}. {section['title']}</query-h2>
+[50+ word introduction]
+"""
+        for sub_idx, sub_title in enumerate(section['subsections'][:num_subsections], 1):
+            batch_prompt += f"""
+<query-h3>{idx}.{sub_idx} {sub_title}</query-h3>
+[150+ words with 3-5 citations from DIFFERENT sources]
+"""
+        
+        batch_prompt += f"""
+CRITICAL RULES:
+1. Use EXACT tags: <query-h2>{idx}. ...</query-h2> and <query-h3>{idx}.1 ...</query-h3>
+2. Citation format: <span class="citation-ref">[N]</span> ONLY
+3. Write 150+ words per subsection with 3-5 citations
+4. VARY citation numbers [1] through [8] - NEVER use [1] repeatedly
+5. NO bullet points - flowing paragraphs only"""
+
+        try:
+            batch_content = await llm_complete_with_provider(
+                prompt=batch_prompt,
+                system_prompt=f"Write comprehensive academic content. Use ONLY HTML tags. {lang_instr}",
+                provider=provider,
+                fallback_provider=fallback,
+                max_tokens=8192,
+                temperature=0.3
+            )
+            full_content_parts.append(batch_content)
+            yield json.dumps({"type": "content", "section": f"section_{idx}", "section_title": section['title'], "content": batch_content, "progress": int(progress)}) + "\n"
+        except Exception as e:
+            error_content = f"\n<query-h2>{idx}. {section['title']}</query-h2>\n\n[Section error: {str(e)}]\n\n"
+            full_content_parts.append(error_content)
+    
+    # Conclusion
+    yield json.dumps({"type": "status", "stage": "conclusion", "message": "Generating Conclusion...", "progress": 90}) + "\n"
+    
+    concl_prompt = f"""Write Conclusion for: {query}
+
+AVAILABLE SOURCES FOR CITATION:
+{source_list}
+
+CITATION REQUIREMENTS - CRITICAL:
+1. Use EXACT format: <span class="citation-ref">[N]</span>
+2. Include citations from at least 8+ DIFFERENT sources
+3. VARY between sources [1], [2], [3], [4], [5], [6], [7], [8] - do NOT repeat [1]
+
+CORRECT (VARIED citations):
+"Management affects outcomes <span class="citation-ref">[1]</span>. Motivation drives engagement <span class="citation-ref">[3]</span>. Participation reinforces learning <span class="citation-ref">[5]</span>."
+
+WRONG (REPEATING [1]):
+"Management affects outcomes <span class="citation-ref">[1]</span>. Motivation drives engagement <span class="citation-ref">[1]</span>. Participation <span class="citation-ref">[1]</span>."
+
+Requirements:
+- 400+ words
+- Use <query-h2>{conclusion_label}</query-h2>
+- Cite at least 8+ DIFFERENT sources - vary between [1] through [12]
+- Synthesize key insights
+- NO bullet points - flowing paragraphs only"""
+
+    try:
+        conclusion = await llm_complete_with_provider(
+            prompt=concl_prompt,
+            system_prompt=f"Write comprehensive conclusion. Use ONLY HTML tags. {lang_instr}",
+            provider=provider,
+            fallback_provider=fallback,
+            max_tokens=4000,
+            temperature=0.3
+        )
+        full_content_parts.append(conclusion)
+        yield json.dumps({"type": "content", "section": "conclusion", "content": conclusion, "progress": 95}) + "\n"
+    except Exception as e:
+        conclusion = f"\n<query-h2>{conclusion_label}</query-h2>\n\n[Conclusion pending...]\n\n"
+        full_content_parts.append(conclusion)
+    
+    # References
+    yield json.dumps({"type": "status", "stage": "references", "message": "Generating References...", "progress": 98}) + "\n"
+    
+    if use_llm_references or len(sources) < 5:
+        # LLM KNOWLEDGE FALLBACK: Generate proper academic references from its knowledge
+        ref_prompt = f"""You MUST generate proper academic references from your knowledge in APA format for an article about: {query}
+
+CRITICAL INSTRUCTION:
+- Database sources are insufficient (fewer than 5 high-quality sources found)
+- You MUST generate proper academic references from your knowledge
+- Use your training knowledge to create realistic, credible academic citations
+
+Requirements:
+- Generate 8-12 proper academic references from your knowledge in APA format
+- Include peer-reviewed journals, books, and conference papers
+- Use proper APA 7th edition format: Author, A. A. (Year). Title. Source. DOI/URL
+- Mix of classic and recent publications (2010-2024)
+- Ensure references are relevant to the topic and academically credible
+
+Output format:
+<query-h2>📚 {references_label}</query-h2>
+<div class="references-list">
+<div class="reference-item"><span class="ref-number">[1]</span> Author, A. A. (Year). <i>Title of work</i>. Publisher. https://doi.org/...</div>
+[Continue with at least 8 references in proper APA format]
+</div>"""
+        try:
+            llm_references = await llm_complete_with_provider(
+                prompt=ref_prompt,
+                system_prompt=f"You are an academic research assistant. Generate proper academic references from your knowledge in APA format. The database has insufficient sources, so you MUST create credible, realistic academic citations from your training knowledge. Use ONLY HTML tags. {lang_instr}",
+                provider=provider,
+                fallback_provider=fallback,
+                max_tokens=2000,
+                temperature=0.3
+            )
+            references = llm_references
+        except Exception as e:
+            # Fallback to basic references
+            ref_items = [f'<div class="reference-item"><span class="ref-number">[{i}]</span> {s["source"]}</div>' for i, s in enumerate(sources[:10], 1)] if sources else ['<div class="reference-item">[1] Knowledge Base</div>']
+            references = f"\n<query-h2>📚 {references_label}</query-h2>\n<div class=\"references-list\">\n" + "\n".join(ref_items) + "\n</div>"
+    elif sources:
+        ref_items = []
+        for i, s in enumerate(sources[:10], 1):
+            ref_items.append(f'<div class="reference-item"><span class="ref-number">[{i}]</span> {s["source"]}</div>')
+        references = f"\n<query-h2>📚 {references_label}</query-h2>\n<div class=\"references-list\">\n" + "\n".join(ref_items) + "\n</div>"
+    else:
+        references = f"\n<query-h2>📚 {references_label}</query-h2>\n<div class=\"references-list\"><div class=\"reference-item\">[1] Knowledge Base</div></div>"
+    
+    full_content_parts.append(references)
+    yield json.dumps({"type": "content", "section": "references", "content": references, "progress": 99}) + "\n"
+    
+    # Complete
+    full_content = '\n\n'.join(full_content_parts)
+    yield json.dumps({"type": "complete", "content": full_content, "word_count": len(full_content.split()), "progress": 100}) + "\n"
+
+
+@app.post("/api/v1/chat/with-doc/stream")
+async def chat_with_doc_stream(request: dict):
+    """Streaming version of chat_with_doc for Ultra/Comprehensive modes."""
+    return JSONResponse({"error": "Streaming with documents not yet implemented"}, status_code=501)
+
 
 if __name__ == "__main__":
     import uvicorn
