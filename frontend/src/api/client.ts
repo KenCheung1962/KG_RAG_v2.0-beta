@@ -377,13 +377,8 @@ export async function sendQueryStreaming(
   onEvent: (event: StreamingEvent) => void,
   signal?: AbortSignal
 ): Promise<void> {
-  const isUltra = request.ultra_comprehensive;
-  const isComprehensive = request.detailed;
-  
-  // Only use streaming for Ultra/Comprehensive modes
-  if (!isUltra && !isComprehensive) {
-    throw new Error('Streaming is only supported for Ultra-Deep and Comprehensive modes');
-  }
+  // Streaming now supported for ALL modes (Quick, Balanced, Comprehensive, Ultra-Deep)
+  // for progressive content display and better UX
   
   const llmConfig = getLLMConfig();
   const providerConfig: LLMProviderConfig = {

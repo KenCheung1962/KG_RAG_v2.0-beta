@@ -1,23 +1,38 @@
-# KG RAG Search Modes: Complete Summary
+# KG RAG Search & Query Modes: Complete Summary
+
+> **Version**: 2.0-beta  
+> **Last Updated**: 2026-04-01
 
 ## Overview
 
-KG RAG v2.0-beta provides **four implemented search modes**, all leveraging **three embedding types** (chunk, entity, relationship) to provide comprehensive search capabilities.
+KG RAG v2.0-beta provides **five search modes** and **four query modes**, all leveraging **three embedding types** (chunk, entity, relationship) to provide comprehensive search and response capabilities.
 
 ---
 
-## Search Mode Comparison
+## Quick Reference
 
-| Mode | Backend Name | Primary Strategy | Embedding Types | Best For |
-|------|-------------|------------------|-----------------|----------|
-| **Smart** ⭐ | `smart` | Multi-layer unified | All three | All queries (Recommended) |
-| **Semantic** | `semantic` / `semantic-hybrid` | Vector similarity | Chunk only | Simple queries |
-| **Entity-Lookup** | `entity-lookup` | Entity-centric + keywords | All three | Entity-focused queries |
-| **Graph-Traversal** | `graph-traversal` | Graph BFS + reasoning | All three | Relationship queries |
+### Search Modes (How to Retrieve)
+
+| Mode | Backend Name | Primary Strategy | Best For |
+|------|-------------|------------------|----------|
+| **Smart** ⭐ | `smart` | Multi-layer unified | All queries (Recommended) |
+| **Semantic** | `semantic` | Vector similarity | Conceptual questions |
+| **Semantic-Hybrid** | `semantic-hybrid` | Vector + keywords | Technical queries |
+| **Entity-Lookup** | `entity-lookup` | Entity-centric + expansion | Entity-focused queries |
+| **Graph-Traversal** | `graph-traversal` | Graph BFS + reasoning | Relationship queries |
+
+### Query Modes (How to Respond)
+
+| Mode | Words | Sections | Academic Refs | Best For |
+|------|-------|----------|---------------|----------|
+| **Quick** | 600-1200 | 3 | 6 (5-8 range) | Fast lookups |
+| **Balanced** | 1500-2000 | 4 | 10 (8-12 range) | Standard research |
+| **Comprehensive** | 1800-2500 | 5 | 14 (12-16 range) | Deep analysis |
+| **Ultra-Deep** | 2500-3500 | 7 | 18 (16-20 range) | Academic papers |
 
 ---
 
-## Detailed Mode Descriptions
+## Search Modes Detailed
 
 ### 1. SMART Mode (Recommended) ⭐
 
@@ -26,11 +41,11 @@ KG RAG v2.0-beta provides **four implemented search modes**, all leveraging **th
 **Complexity:** High (automated)
 
 **What it does:**
-Intelligently combines ALL search strategies in 5 layers:
+Intelligently combines ALL search strategies in 5 layers with strict quality filtering:
 
 ```
 Layer 1: Semantic Chunk Search (Foundation)
-    └── Direct vector search on chunks
+    └── Vector search on chunks (initial: similarity ≥ 0.5)
 
 Layer 2: Entity Discovery
     └── Entity embedding search → find relevant entities
@@ -44,12 +59,24 @@ Layer 4: Keyword Boosting
     └── Extract HL/LL keywords → boost matching chunks
 
 Layer 5: Entity Chunk Collection
-    └── Get chunks from all discovered entities
+    └── Get chunks from all discovered entities (max 5 per entity)
 
-Final: Intelligent Fusion
+Final: Intelligent Fusion + Strict Filtering
     ├── Deduplicate across all sources
     ├── Apply layer-specific boosting
-    └── Rank by composite similarity score
+    ├── Rank by composite similarity score
+    └── STRICT FILTER: similarity ≥ 0.7
+```
+
+**Key Parameters**:
+```python
+{
+    "similarity_threshold": 0.7,    # Strict quality filter
+    "entity_boost_factor": 0.12,
+    "max_entities": 8,
+    "chunks_per_entity": 5,         # Reduced from 12
+    "max_db_sources": 10            # In references
+}
 ```
 
 **Best for:**
@@ -64,7 +91,7 @@ Final: Intelligent Fusion
 - "Explain the relationship between blockchain and supply chain management"
 
 **Performance:**
-- Typical results: 40-60 chunks
+- Typical results: 40-60 chunks → 5-10 sources after strict filtering
 - Latency: ~2-3 seconds
 - Coverage: Highest (combines all sources)
 
@@ -72,20 +99,34 @@ Final: Intelligent Fusion
 
 ### 2. SEMANTIC Mode
 
-**Backend Mode:** `semantic` / `semantic-hybrid`  
-**WebUI Button:** Semantic  
+**Backend Mode:** `semantic`  
 **Complexity:** Low
 
 **What it does:**
-Direct vector similarity search on chunks:
+Direct vector similarity search on chunks with relationship enhancement:
 
 ```python
+# 1. Vector search
 vector_results = await storage.search_chunks(
     query_vector=query_embedding,
-    limit=initial_k,
-    distance_metric=DistanceMetric.COSINE,
-    match_threshold=0.2
+    limit=40,
+    distance_metric=DistanceMetric.COSINE
 )
+
+# 2. Relationship enhancement
+enhanced_results = await enhance_with_relationships(vector_results)
+
+# 3. Strict filtering
+filtered_results = [r for r in enhanced_results if r.similarity >= 0.7]
+```
+
+**Key Parameters**:
+```python
+{
+    "similarity_threshold": 0.7,
+    "entity_boost_factor": 0.10,
+    "max_entities": 5
+}
 ```
 
 **Best for:**
@@ -99,19 +140,52 @@ vector_results = await storage.search_chunks(
 - "Explain quantum computing principles"
 
 **Performance:**
-- Typical results: 35-45 chunks
+- Typical results: 35-45 chunks → 5-10 sources after filtering
 - Latency: ~1 second
-- Coverage: Good (chunks only)
+- Coverage: Good (chunks + relationship boost)
 
 ---
 
-### 3. ENTITY-LOOKUP Mode
+### 3. SEMANTIC-HYBRID Mode
+
+**Backend Mode:** `semantic-hybrid`  
+**Complexity:** Medium
+
+**What it does:**
+Combines vector similarity with keyword matching:
+
+```
+1. Vector search (same as semantic)
+2. High-level keyword extraction (LLM)
+3. Keyword boosting (+0.05 to matching chunks)
+4. Relationship enhancement
+5. Combined ranking + strict filtering (≥ 0.7)
+```
+
+**Key Parameters**:
+```python
+{
+    "similarity_threshold": 0.7,
+    "entity_boost_factor": 0.10,
+    "max_entities": 6,
+    "keyword_boost": 0.05
+}
+```
+
+**Best for:**
+- Queries with important concept keywords
+- When specific terminology matters
+- Technical questions
+
+---
+
+### 4. ENTITY-LOOKUP Mode
 
 **Backend Mode:** `entity-lookup`  
 **Complexity:** Medium
 
 **What it does:**
-Comprehensive entity-based search using ALL embedding types:
+Comprehensive entity-based search with aggressive expansion:
 
 ```
 Query ─┬─► Entity Embeddings ─► Find Entities ─┬─► Keyword Boost ─┐
@@ -119,19 +193,22 @@ Query ─┬─► Entity Embeddings ─► Find Entities ─┬─► Keyword B
        ├─► Relationship Embeddings ─► Find Related Entities ◄────┤
        │                                                          │
        ├─► Chunk Embeddings ─► Direct Semantic Search ─┬─► Collect Chunks
-       │                                                │
+       │                                                │     (max 5/entity)
        └───────────────────────────────────────────────┘
                             │
                             ▼
-                    Deduplicate & Rank ─► Return Top K
+                    Deduplicate & Rank ─► STRICT FILTER (≥ 0.7)
 ```
 
-**Layers:**
-1. **Entity Embeddings** - Primary search to find matching entities
-2. **Keyword Extraction** - Extract and match HL/LL keywords for boosting
-3. **Relationship Embeddings** - Find related entities via vector search + graph
-4. **Chunk Embeddings** - Direct semantic search + entity-linked chunks
-5. **Relationship Content** - Add relationship descriptions as context
+**Key Parameters**:
+```python
+{
+    "similarity_threshold": 0.7,
+    "entity_boost_factor": 0.12,
+    "max_entities": 8,              # Higher expansion
+    "chunks_per_entity": 5          # Reduced from 12
+}
+```
 
 **Best for:**
 - Specific entity-focused questions
@@ -144,13 +221,13 @@ Query ─┬─► Entity Embeddings ─► Find Entities ─┬─► Keyword B
 - "What are Apple's main suppliers?"
 
 **Performance:**
-- Typical results: 35-50 chunks
+- Typical results: 35-50 chunks → 5-10 sources after filtering
 - Latency: ~1.5-2 seconds
 - Coverage: Good (entity focus + relationship expansion)
 
 ---
 
-### 4. GRAPH-TRAVERSAL Mode
+### 5. GRAPH-TRAVERSAL Mode
 
 **Backend Mode:** `graph-traversal`  
 **Complexity:** High
@@ -171,22 +248,18 @@ Query ─┬─► Relationship Embeddings ─► Find Matching Relationships �
        └─► Collect All Chunks ─► Graph Reasoning (Hub Detection) ─┘
                                           │
                                           ▼
-                              Deduplicate & Rank ─► Return Top K
+                              STRICT FILTER (≥ 0.7) ─► Return Top K
 ```
 
-**Layers:**
-1. **Relationship Embeddings** - **PRIMARY** mechanism for relationship-based retrieval
-2. **Entity Embeddings** - Find seed entities for graph expansion
-3. **Graph Traversal** - 2-hop BFS with path tracking and depth scoring
-4. **Chunk Embeddings** - Direct search + graph-entity chunks
-5. **Graph Reasoning** - Hub detection, centrality scoring, connectivity analysis
-
-**Key Features:**
-- Uses Recursive CTE for graph traversal
-- Parallel relationship embedding search
-- Full path reconstruction
-- Depth-based scoring (closer = higher score)
-- Hub entity detection and boosting
+**Key Parameters**:
+```python
+{
+    "similarity_threshold": 0.7,
+    "max_depth": 2,
+    "entity_boost_factor": 0.08,
+    "max_relationships": 8
+}
+```
 
 **Best for:**
 - Overview questions
@@ -198,26 +271,194 @@ Query ─┬─► Relationship Embeddings ─► Find Matching Relationships �
 - "How do tech companies compete in the AI space?"
 - "What partnerships exist in the EV industry?"
 - "Show me the competitive landscape for cloud providers"
-- "How are companies connected in the semiconductor supply chain?"
 
 **Performance:**
-- Typical results: 40-60 chunks
+- Typical results: 40-60 chunks → 5-10 sources after filtering
 - Latency: ~2-4 seconds
 - Coverage: Highest for relationship queries
 
 ---
 
+## Query Modes Detailed
+
+Query modes determine how the response is **generated** after search retrieval.
+
+### Streaming Support
+
+**All query modes now support streaming** for progressive display:
+
+```json
+{"type": "status", "stage": "outline", "progress": 0}
+{"type": "content", "section": "executive_summary", "progress": 15}
+{"type": "content", "section": "section_1", "progress": 30}
+...
+{"type": "complete", "word_count": 1850}
+```
+
+### 1. QUICK Mode
+
+**Purpose**: Fast, concise answers  
+**Use for**: Simple factual questions, quick lookups
+
+```python
+{
+    "detail_level": "quick",
+    "target_words": "600-1200",
+    "num_sections": 3,
+    "num_subsections": 2,
+    "num_academic_refs": 6,         # 5-8 range
+    "max_tokens": 8192,
+    "streaming": True
+}
+```
+
+**Response Structure**:
+```
+1. Executive Summary (150+ words)
+2. Section 1-3 (each with 2 subsections)
+3. Conclusion (200+ words)
+4. References (DB sources + 6 academic refs)
+```
+
+---
+
+### 2. BALANCED Mode (Default)
+
+**Purpose**: Detailed but focused answers  
+**Use for**: Standard research questions
+
+```python
+{
+    "detail_level": "balanced",
+    "target_words": "1500-2000",
+    "num_sections": 4,
+    "num_subsections": 3,
+    "num_academic_refs": 10,        # 8-12 range
+    "max_tokens": 8192,
+    "streaming": True
+}
+```
+
+**Response Structure**:
+```
+1. Executive Summary (300+ words)
+2. Section 1-4 (each with 3 subsections)
+3. Conclusion (400+ words)
+4. References (DB sources + 10 academic refs)
+```
+
+---
+
+### 3. COMPREHENSIVE Mode
+
+**Purpose**: In-depth analysis with extensive coverage  
+**Use for**: Complex research questions, literature review style
+
+```python
+{
+    "detail_level": "comprehensive",
+    "target_words": "1800-2500",
+    "num_sections": 5,
+    "num_subsections": 3,
+    "num_academic_refs": 14,        # 12-16 range
+    "max_tokens": 8192,
+    "streaming": True
+}
+```
+
+**Response Structure**:
+```
+1. Executive Summary (400+ words)
+2. Section 1-5 (each with 3 subsections)
+3. Conclusion (500+ words)
+4. References (DB sources + 14 academic refs)
+```
+
+---
+
+### 4. ULTRA-DEEP Mode
+
+**Purpose**: Maximum detail, exhaustive coverage  
+**Use for**: Academic research, survey paper style
+
+```python
+{
+    "detail_level": "ultra-deep",
+    "target_words": "2500-3500",
+    "num_sections": 7,
+    "num_subsections": 3,
+    "num_academic_refs": 18,        # 16-20 range
+    "max_tokens": 8192,
+    "streaming": True
+}
+```
+
+**Response Structure**:
+```
+1. Executive Summary (500+ words)
+2. Section 1-7 (each with 3 subsections)
+3. Conclusion (600+ words)
+4. References (DB sources + 18 academic refs)
+```
+
+---
+
 ## Embedding Usage Matrix
 
-| Embedding Type | Smart | Semantic | Entity-Lookup | Graph-Traversal |
-|----------------|-------|----------|---------------|-----------------|
-| **Chunk Embeddings** | ✅ Primary | ✅ Only | ✅ Yes | ✅ Yes |
-| **Entity Embeddings** | ✅ Discovery | ❌ No | ✅ Primary | ✅ Seeds |
-| **Relationship Embeddings** | ✅ Enhancement | ❌ No | ✅ Enhancement | ✅ Primary |
-| **Keyword Extraction** | ✅ Boosting | ❌ No | ✅ Boosting | ❌ No |
-| **Graph Traversal** | ✅ 1-hop | ❌ No | ✅ 1-hop | ✅ 2-hop |
-| **Path Tracking** | ❌ No | ❌ No | ❌ No | ✅ Yes |
-| **Graph Reasoning** | ❌ No | ❌ No | ❌ No | ✅ Yes |
+| Embedding Type | Smart | Semantic | Semantic-Hybrid | Entity-Lookup | Graph-Traversal |
+|----------------|-------|----------|-----------------|---------------|-----------------|
+| **Chunk Embeddings** | ✅ Primary | ✅ Only | ✅ Primary | ✅ Yes | ✅ Yes |
+| **Entity Embeddings** | ✅ Discovery | ❌ No | ❌ No | ✅ Primary | ✅ Seeds |
+| **Relationship Embeddings** | ✅ Enhancement | ✅ Enhancement | ✅ Enhancement | ✅ Enhancement | ✅ Primary |
+| **Keyword Extraction** | ✅ Boosting | ❌ No | ✅ Boosting | ✅ Boosting | ❌ No |
+| **Graph Traversal** | ✅ 1-hop | ❌ No | ❌ No | ✅ 1-hop | ✅ 2-hop |
+| **Strict Filtering (≥0.7)** | ✅ Yes | ✅ Yes | ✅ Yes | ✅ Yes | ✅ Yes |
+
+---
+
+## Reference Generation System
+
+### Dual-Source References
+
+All responses include references from **two sources**:
+
+```
+┌──────────────────────────────┬─────────────────────────────────┐
+│   DATABASE SOURCES           │   LLM ACADEMIC REFERENCES       │
+│   (Actual Documents)         │   (Generated from Knowledge)    │
+├──────────────────────────────┼─────────────────────────────────┤
+│ • Real document chunks       │ • APA 7th edition format        │
+│ • Similarity ≥ 0.7           │ • Training knowledge synthesis  │
+│ • Up to 10 sources           │ • Mode-specific count (6-18)    │
+│ • Numbered [1] to [N]        │ • Numbered [N+1] onwards        │
+└──────────────────────────────┴─────────────────────────────────┘
+```
+
+### Mode-Specific Academic Reference Counts
+
+| Query Mode | Refs Range | Actual Count | Example Numbering |
+|------------|-----------|--------------|-------------------|
+| Quick | 5-8 | 6 | [N+1] to [N+6] |
+| Balanced | 8-12 | 10 | [N+1] to [N+10] |
+| Comprehensive | 12-16 | 14 | [N+1] to [N+14] |
+| Ultra-Deep | 16-20 | 18 | [N+1] to [N+18] |
+
+### Citation Format
+
+**In-text citations**:
+```html
+<span class="citation-ref">[N]</span>
+
+<!-- Example -->
+<p>Research shows HBM improves performance <span class="citation-ref">[1]</span>. 
+Academic studies confirm <span class="citation-ref">[4]</span>.</p>
+```
+
+**Citation requirements**:
+- Minimum 8 different sources in Executive Summary and Conclusion
+- Must mix database sources [1-N] and academic references [N+1 onwards]
+- No consecutive repeats of the same source
+- Post-processing automatically fixes repeated citations
 
 ---
 
@@ -225,58 +466,160 @@ Query ─┬─► Relationship Embeddings ─► Find Matching Relationships �
 
 ### Quick Selection Guide
 
-| Your Question Type | Recommended Mode |
-|-------------------|------------------|
-| "What is X?" / "How does Y work?" | **Smart** or Semantic |
-| "Tell me about Company X" | **Smart** or Entity-lookup |
-| "How do X and Y relate?" | **Smart** or Graph-traversal |
-| "What partnerships exist?" | **Smart** or Graph-traversal |
-| "What are the benefits of X?" | **Smart** or Semantic |
-| Quick/simple lookup | Semantic |
-| Deep entity analysis | Entity-lookup |
-| Industry overview | Graph-traversal |
+| Your Question Type | Recommended Search | Recommended Query |
+|-------------------|-------------------|-------------------|
+| "What is X?" / "How does Y work?" | **Smart** | Balanced |
+| Quick factual lookup | Semantic | Quick |
+| "Tell me about Company X" | **Smart** or Entity-lookup | Balanced |
+| "How do X and Y relate?" | **Smart** or Graph-traversal | Comprehensive |
+| Deep academic research | **Smart** | Ultra-Deep |
+| Industry overview | **Smart** or Graph-traversal | Comprehensive |
 
 ### API Usage Examples
 
 ```bash
-# Smart mode (RECOMMENDED - default)
+# Default (Smart search + Balanced response)
 curl -X POST http://localhost:8002/api/v1/chat \
   -H "Content-Type: application/json" \
-  -d '{"message": "What are the benefits of AI?", "mode": "smart"}'
+  -d '{"message": "What are the benefits of AI?"}'
 
-# Semantic mode (simple vector search)
+# Smart search with specific query mode
 curl -X POST http://localhost:8002/api/v1/chat \
   -H "Content-Type: application/json" \
-  -d '{"message": "How does blockchain work?", "mode": "semantic"}'
+  -d '{
+    "message": "What are the benefits of AI?",
+    "mode": "smart",
+    "detail_level": "comprehensive"
+  }'
 
 # Entity-lookup mode
 curl -X POST http://localhost:8002/api/v1/chat \
   -H "Content-Type: application/json" \
-  -d '{"message": "What products does Tesla make?", "mode": "entity-lookup"}'
+  -d '{
+    "message": "What products does Tesla make?",
+    "mode": "entity-lookup",
+    "detail_level": "balanced"
+  }'
 
-# Graph-traversal mode
+# Graph-traversal with streaming
 curl -X POST http://localhost:8002/api/v1/chat \
   -H "Content-Type: application/json" \
-  -d '{"message": "How do companies compete in AI?", "mode": "graph-traversal", "max_depth": 2}'
+  -d '{
+    "message": "How do companies compete in AI?",
+    "mode": "graph-traversal",
+    "detail_level": "comprehensive",
+    "stream": true
+  }'
 
-# Query+File with any mode
-curl -X POST http://localhost:8002/api/v1/chat/with-doc \
+# Full configuration
+curl -X POST http://localhost:8002/api/v1/chat \
   -H "Content-Type: application/json" \
   -d '{
-    "message": "Explain the supply chain",
-    "filenames": ["report.pdf"],
-    "mode": "smart"
+    "message": "Your question here",
+    "mode": "smart",
+    "detail_level": "ultra-deep",
+    "top_k": 10,
+    "similarity_threshold": 0.7,
+    "use_llm_references": true,
+    "stream": true
   }'
 ```
 
-### WebUI Usage
+---
 
-The WebUI provides 4 buttons:
+## Configuration Parameters
 
-1. **Smart** ⭐ (default) - Best for most queries
-2. **Semantic** - Simple semantic search
-3. **Entity-lookup** - Entity-focused search
-4. **Graph-traversal** - Relationship exploration
+### Search Configuration
+
+```python
+# Similarity thresholds
+SIMILARITY_THRESHOLD_INITIAL = 0.5      # First pass collection
+SIMILARITY_THRESHOLD_STRICT = 0.7       # Final filtering (all modes)
+SIMILARITY_THRESHOLD_ENTITY_CHUNK = 0.65 # Entity context minimum
+
+# Source limits
+MAX_DB_SOURCES = 10                     # Max in reference section
+MAX_SOURCES_PROCESSING = 15             # Internal processing limit
+
+# Relationship enhancement
+RELATIONSHIP_BOOST_FACTORS = {
+    "smart": 0.12,
+    "semantic": 0.10,
+    "semantic-hybrid": 0.10,
+    "entity-lookup": 0.12,
+    "graph-traversal": 0.08
+}
+
+# Entity expansion limits
+MAX_ENTITIES = {
+    "smart": 8,
+    "semantic": 5,
+    "semantic-hybrid": 6,
+    "entity-lookup": 8,
+    "graph-traversal": 5
+}
+
+# Entity chunk collection (reduced from 12)
+CHUNKS_PER_ENTITY = 5
+```
+
+### Query Mode Configuration
+
+```python
+QUERY_MODE_CONFIG = {
+    "quick": {
+        "target_words": "600-1200",
+        "num_sections": 3,
+        "num_subsections": 2,
+        "num_academic_refs": 6,      # 5-8 range
+        "max_tokens": 8192
+    },
+    "balanced": {
+        "target_words": "1500-2000",
+        "num_sections": 4,
+        "num_subsections": 3,
+        "num_academic_refs": 10,     # 8-12 range
+        "max_tokens": 8192
+    },
+    "comprehensive": {
+        "target_words": "1800-2500",
+        "num_sections": 5,
+        "num_subsections": 3,
+        "num_academic_refs": 14,     # 12-16 range
+        "max_tokens": 8192
+    },
+    "ultra-deep": {
+        "target_words": "2500-3500",
+        "num_sections": 7,
+        "num_subsections": 3,
+        "num_academic_refs": 18,     # 16-20 range
+        "max_tokens": 8192
+    }
+}
+```
+
+---
+
+## Performance Summary
+
+### Search Performance
+
+| Mode | Typical Results | After Filtering (≥0.7) | Latency | Coverage |
+|------|----------------|----------------------|---------|----------|
+| Smart | 40-60 chunks | 5-10 sources | ~2-3s | All embeddings |
+| Semantic | 35-45 chunks | 5-10 sources | ~1s | Chunks + rel |
+| Semantic-Hybrid | 35-45 chunks | 5-10 sources | ~1.5s | Chunks + rel |
+| Entity-lookup | 35-50 chunks | 5-10 sources | ~1.5-2s | All embeddings |
+| Graph-traversal | 40-60 chunks | 5-10 sources | ~2-4s | All embeddings |
+
+### Query Performance
+
+| Mode | Target Words | Generation Time | Total References |
+|------|-------------|-----------------|------------------|
+| Quick | 600-1200 | ~30s | DB + 6 academic |
+| Balanced | 1500-2000 | ~60s | DB + 10 academic |
+| Comprehensive | 1800-2500 | ~90s | DB + 14 academic |
+| Ultra-Deep | 2500-3500 | ~120s | DB + 18 academic |
 
 ---
 
@@ -308,6 +651,16 @@ The WebUI provides 4 buttons:
 │  • get_related_entities() - Graph traversal                      │
 │  • get_chunks_by_entity() - Entity chunk retrieval               │
 └─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              Query Mode Processor                               │
+│                                                                   │
+│  • Quick/Balanced/Comprehensive/Ultra-Deep                      │
+│  • Streaming generation                                          │
+│  • Reference generation (DB + LLM academic)                      │
+│  • Citation formatting                                           │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ### Key Functions
@@ -315,14 +668,13 @@ The WebUI provides 4 buttons:
 | Function | File | Purpose |
 |----------|------|---------|
 | `search_smart()` | `pgvector_api.py` | Smart mode - 5-layer unified search |
-| `search_entity_lookup()` | `pgvector_api.py` | Entity-lookup mode - entity-centric |
-| `search_graph_traversal()` | `pgvector_api.py` | Graph mode - traversal + reasoning |
-| `extract_keywords_for_search()` | `pgvector_api.py` | Keyword extraction for boosting |
-| `search_chunks()` | `storage.py` | Chunk vector search |
-| `search_entities()` | `storage.py` | Entity vector search |
-| `search_relationships()` | `storage.py` | Relationship vector search |
-| `get_related_entities()` | `storage.py` | Graph traversal using recursive CTE |
-| `get_chunks_by_entity()` | `storage.py` | Get chunks by entity ID |
+| `search_entity_lookup()` | `pgvector_api.py` | Entity-lookup mode |
+| `search_graph_traversal()` | `pgvector_api.py` | Graph mode - traversal |
+| `chat_stream()` | `pgvector_api.py` | Streaming response handler |
+| `generate_ultra_response_streaming()` | `pgvector_api.py` | Multi-step generation |
+| `generate_llm_academic_references()` | `pgvector_api.py` | Academic reference generation |
+| `post_process_citations()` | `pgvector_api.py` | Fix repeated citations |
+| `extract_keywords_for_search()` | `pgvector_api.py` | Keyword extraction |
 
 ---
 
@@ -332,8 +684,8 @@ The WebUI provides 4 buttons:
 
 | Table | Total | With Embeddings | Percentage |
 |-------|-------|-----------------|------------|
-| Chunks | ~165,000 | ~165,000 | ✅ 100% |
-| Entities | 46,012 | ~46,012* | 🟡 Being backfilled |
+| Chunks | 369,004 | 369,004 | ✅ 100% |
+| Entities | 46,012 | ~46,012* | ✅ Complete |
 | Relationships | 116,796 | ~72,000 | 🟡 ~62% (background processing) |
 
 \* New uploads have embeddings; existing being backfilled
@@ -350,41 +702,39 @@ python3 backfill_entity_embeddings_robust.py --wait-for-relationships
 
 ---
 
-## Performance Summary
-
-| Mode | Typical Results | Latency | Coverage | Use Case |
-|------|----------------|---------|----------|----------|
-| Smart | 40-60 chunks | ~2-3s | All embeddings | Default, all queries |
-| Semantic | 35-45 chunks | ~1s | Chunks only | Simple queries |
-| Entity-lookup | 35-50 chunks | ~1.5-2s | All embeddings | Entity questions |
-| Graph-traversal | 40-60 chunks | ~2-4s | All embeddings | Relationship questions |
-
----
-
 ## Recommendations
 
 ### For Users
+
 1. **Use Smart mode by default** - It automatically combines the best strategies
-2. **Use Semantic for quick answers** - Fastest, good for simple questions
-3. **Use Entity-lookup for specific entities** - Better entity focus with keywords
-4. **Use Graph-traversal for relationships** - Best for "how do X and Y relate"
+2. **Use Quick mode for fast answers** - Best for simple factual questions
+3. **Use Ultra-Deep for academic work** - Maximum detail and references
+4. **Enable LLM references** - Adds academic credibility with APA citations
+5. **Keep similarity threshold at 0.7** - Ensures high-quality sources
 
 ### For Developers
+
 1. **Smart mode has the best coverage** - Use for maximum recall
-2. **All modes use unified storage functions** - Consistent interface
-3. **Graceful degradation** - Works even if some embeddings are missing
-4. **Easy to extend** - Add new layers to existing modes
+2. **All modes use strict filtering (≥0.7)** - Ensures quality
+3. **Streaming works for all query modes** - Progressive display
+4. **Mode-specific reference counts** - Adjust based on response depth needed
+5. **Graceful degradation** - Works even if some embeddings are missing
 
 ---
 
 ## Summary
 
-KG RAG provides a **unified search architecture** where:
+KG RAG v2.0-beta provides a **unified search and query architecture**:
 
-- **4 modes** cover all search use cases
-- **All specialized modes** use all three embedding types
-- **Smart mode** automatically combines the best strategies
+- **5 search modes** cover all retrieval use cases
+- **4 query modes** provide appropriate response depth
+- **All modes** use strict similarity filtering (≥ 0.7)
+- **Dual-source references** combine database sources + LLM academic references
+- **Streaming support** for all query modes
 - **Background processors** continue enhancing embedding coverage
-- **Both chat endpoints** (`/chat` and `/chat/with-doc`) support all modes
+- **Both chat endpoints** support all mode combinations
 
-**The recommended approach:** Use **Smart mode** for all queries unless you have a specific reason to use another mode.
+**The recommended approach:**
+- **Search**: Use **Smart mode** for all queries
+- **Query**: Use **Balanced** for standard queries, **Ultra-Deep** for academic work
+- **References**: Always enable `use_llm_references: true` for academic credibility

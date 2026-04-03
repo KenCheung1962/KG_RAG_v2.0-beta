@@ -67,12 +67,16 @@ function printAnswer(event?: Event): void {
   // Remove HTML paragraph tags but preserve reference structure
   processedText = processedText.replace(/<\/?p>/gi, '');
   
+  // Convert <i> tags to markdown italics before stripping other HTML
+  processedText = processedText.replace(/<i>([^<]*)<\/i>/gi, '*$1*');
+  
   // Convert reference items to a printable format before removing divs
   // Handle format: <div class="reference-item"><span class="ref-number">1.</span> <span class="ref-source">Name</span></div>
-  processedText = processedText.replace(/<div[^>]*class="reference-item"[^>]*>\s*<span[^>]*class="ref-number"[^>]*>(\d+\.?)<\/span>\s*(?:<span[^>]*class="ref-source"[^>]*>)?([^<]+)(?:<\/span>)?\s*<\/div>/gi, '[$1] $2<br>');
+  // Updated to preserve italic text: [^]*? is non-greedy match for any content including <i>...</i>
+  processedText = processedText.replace(/<div[^>]*class="reference-item"[^>]*>\s*<span[^>]*class="ref-number"[^>]*>(\d+\.?)<\/span>\s*(?:<span[^>]*class="ref-source"[^>]*>)?([\s\S]*?)(?:<\/span>)?\s*<\/div>/gi, '[$1] $2<br>');
   
   // Also handle simple format: [1] Source name (already converted)
-  // Remove remaining HTML tags but keep citations
+  // Remove remaining HTML tags but keep citations and italics (already converted)
   processedText = processedText.replace(/<\/?(div|span)[^>]*>/gi, '');
   
   // NOTE: We no longer extract/remove the References section separately.
@@ -80,13 +84,15 @@ function printAnswer(event?: Event): void {
   // and will be formatted naturally with the rest of the text.
   // Both screen and print now show the FULL content without truncation.
   
-  // Format markdown-style headings and bold text
+  // Format markdown-style headings and bold/italic text
   let formattedAnswer = processedText
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    // Convert **text** to bold
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    // Convert **text** to bold (must be done BEFORE italics to avoid conflicts)
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    // Convert *text* to italics (single asterisks, not already converted)
+    .replace(/\*([^*]+)\*/g, '<i>$1</i>');
   
   // Process headings line by line for proper numbering
   const lines = formattedAnswer.split('\n');
@@ -185,6 +191,40 @@ function printAnswer(event?: Event): void {
 <head>
   <meta charset="UTF-8">
   <title>Query Result</title>
+  
+  <!-- KaTeX for math rendering in print -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  
+  <!-- Math fonts for Unicode math symbols - using font-face for embedding -->
+  <style>
+    /* Embedded Noto Sans Math font for PDF compatibility */
+    @font-face {
+      font-family: 'Noto Sans Math';
+      font-style: normal;
+      font-weight: 400;
+      font-display: swap;
+      src: url('https://cdn.jsdelivr.net/npm/noto-sans-math@2.1/fonts/NotoSansMath-Regular.woff2') format('woff2'),
+           url('https://cdn.jsdelivr.net/npm/noto-sans-math@2.1/fonts/NotoSansMath-Regular.ttf') format('truetype');
+    }
+    /* KaTeX fonts with embedding hints */
+    @font-face {
+      font-family: 'KaTeX_Main';
+      font-style: normal;
+      font-weight: 400;
+      font-display: swap;
+      src: url('https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/fonts/KaTeX_Main-Regular.woff2') format('woff2');
+    }
+    @font-face {
+      font-family: 'KaTeX_Math';
+      font-style: normal;
+      font-weight: 400;
+      font-display: swap;
+      src: url('https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/fonts/KaTeX_Math-Italic.woff2') format('woff2');
+    }
+  </style>
+  
   <style>
     @page {
       margin: 2.0cm 1.2cm;
@@ -362,6 +402,32 @@ function printAnswer(event?: Event): void {
         font-weight: bold;
         margin-right: 0.2cm;
       }
+      
+      /* Math styling for print */
+      .katex {
+        font-size: 1.05em;
+      }
+      .katex-display {
+        margin: 0.8em 0;
+        overflow-x: auto;
+        overflow-y: hidden;
+        padding: 0.5em;
+        background: rgba(0, 0, 0, 0.03);
+        border-radius: 4px;
+        border-left: 2px solid #4CAF50;
+      }
+      .katex-display .katex {
+        font-size: 1.1em;
+      }
+      /* Unicode math font support */
+      .unicode-math, .answer {
+        font-family: 'Noto Sans Math', 'Cambria Math', 'STIX Two Math', 'Times New Roman', serif;
+      }
+      /* Prevent math from breaking across pages */
+      .katex-display, .katex {
+        break-inside: avoid;
+        page-break-inside: avoid;
+      }
     }
     @media screen {
       body { 
@@ -475,19 +541,369 @@ function printAnswer(event?: Event): void {
   </style>
 </head>
 <body>
-  <div class="answer">${formattedAnswer}</div>
+  <div class="answer unicode-math">${formattedAnswer}</div>
+  
+  <script>
+    // Render KaTeX math when page loads
+    document.addEventListener("DOMContentLoaded", function() {
+      if (typeof renderMathInElement !== 'undefined') {
+        renderMathInElement(document.body, {
+          delimiters: [
+            {left: '$$', right: '$$', display: true},
+            {left: '$', right: '$', display: false},
+            {left: '\\[', right: '\\]', display: true},
+            {left: '\\(', right: '\\)', display: false},
+            {left: '\\begin{equation}', right: '\\end{equation}', display: true},
+            {left: '\\begin{align}', right: '\\end{align}', display: true},
+          ],
+          throwOnError: false,
+          errorColor: '#cc0000'
+        });
+      }
+    });
+    
+    // Also try rendering after a short delay in case scripts load slowly
+    window.addEventListener('load', function() {
+      if (typeof renderMathInElement !== 'undefined') {
+        renderMathInElement(document.body, {
+          delimiters: [
+            {left: '$$', right: '$$', display: true},
+            {left: '$', right: '$', display: false},
+            {left: '\\[', right: '\\]', display: true},
+            {left: '\\(', right: '\\)', display: false},
+            {left: '\\begin{equation}', right: '\\end{equation}', display: true},
+            {left: '\\begin{align}', right: '\\end{align}', display: true},
+          ],
+          throwOnError: false,
+          errorColor: '#cc0000'
+        });
+      }
+    });
+  </script>
 </body>
 </html>`;
 
   // Use Blob URL for more reliable rendering
   const blob = new Blob([html], { type: 'text/html' });
   const url = URL.createObjectURL(blob);
+  
+  // Option 1: Open in new window for browser print-to-PDF
   const printWindow = window.open(url, '_blank');
   
   if (!printWindow) {
     alert('Please allow popups to print the answer.');
     URL.revokeObjectURL(url);
     return;
+  }
+  
+  // Note: For best PDF results, wait a few seconds for fonts to load,
+  // then use browser's Print → Save as PDF feature
+}
+
+/**
+ * Export answer as PDF with embedded fonts
+ * This function ensures fonts are properly loaded before generating PDF
+ */
+async function exportToPDF(): Promise<void> {
+  if (!lastAnswerText) {
+    alert('No answer to export. Please run a query first.');
+    return;
+  }
+  
+  // Show loading indicator
+  const printBtn = getElement('printQueryBtn') as HTMLButtonElement;
+  const originalText = printBtn?.textContent || 'Print Answer';
+  if (printBtn) {
+    printBtn.textContent = '⏳ Preparing PDF...';
+    printBtn.disabled = true;
+  }
+  
+  try {
+    // Process text for print (same as printAnswer)
+    let processedText = lastAnswerText;
+    
+    // Convert backend HTML tags to markdown headers
+    processedText = processedText.replace(/<query-h1>([\s\S]*?)<\/query-h1>/gi, '# $1');
+    processedText = processedText.replace(/<query-h2>([\s\S]*?)<\/query-h2>/gi, '## $1');
+    processedText = processedText.replace(/<query-h3>([\s\S]*?)<\/query-h3>/gi, '### $1');
+    processedText = processedText.replace(/<query-h4>([\s\S]*?)<\/query-h4>/gi, '#### $1');
+    
+    // Convert citations
+    processedText = processedText.replace(/<span[^>]*citation-ref[^>]*>\[(\d+)\]<\/span>/gi, '[$1]');
+    processedText = processedText.replace(/\(\s*Source\s+\d+(?:\s*,\s*Source\s+\d+)*\s*\)/gi, '');
+    processedText = processedText.replace(/Source\s+\d+(?:\s*,\s*Source\s+\d+)*/gi, '');
+    processedText = processedText.replace(/<\/?p>/gi, '');
+    processedText = processedText.replace(/<i>([^<]*)<\/i>/gi, '*$1*');
+    processedText = processedText.replace(/<div[^>]*class="reference-item"[^>]*>\s*<span[^>]*class="ref-number"[^>]*>(\d+\.?)<\/span>\s*(?:<span[^>]*class="ref-source"[^>]*>)?([\s\S]*?)(?:<\/span>)?\s*<\/div>/gi, '[$1] $2<br>');
+    processedText = processedText.replace(/<\/?(div|span)[^>]*>/gi, '');
+    
+    // Format for PDF
+    let formattedAnswer = processedText
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/\*([^*]+)\*/g, '<i>$1</i>');
+    
+    // Build PDF-optimized HTML with font preloading
+    const pdfHtml = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Query Result - PDF Export</title>
+  
+  <!-- Critical: Preload fonts for PDF embedding -->
+  <link rel="preconnect" href="https://cdn.jsdelivr.net">
+  <link rel="preload" href="https://cdn.jsdelivr.net/npm/noto-sans-math@2.1/fonts/NotoSansMath-Regular.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/fonts/KaTeX_Main-Regular.woff2" as="font" type="font/woff2" crossorigin>
+  
+  <!-- KaTeX -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  
+  <style>
+    @page {
+      margin: 2.0cm 1.5cm;
+      size: A4;
+    }
+    
+    /* Font face definitions with proper embedding hints */
+    @font-face {
+      font-family: 'Noto Sans Math';
+      font-style: normal;
+      font-weight: 400;
+      font-display: block; /* Block until font loads for PDF consistency */
+      src: url('https://cdn.jsdelivr.net/npm/noto-sans-math@2.1/fonts/NotoSansMath-Regular.woff2') format('woff2');
+      unicode-range: U+2200-22FF, U+27C0-27EF, U+2980-29FF, U+2A00-2AFF, U+2100-214F;
+    }
+    
+    @font-face {
+      font-family: 'KaTeX_Main';
+      font-style: normal;
+      font-weight: 400;
+      font-display: block;
+      src: url('https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/fonts/KaTeX_Main-Regular.woff2') format('woff2');
+    }
+    
+    @font-face {
+      font-family: 'KaTeX_Math';
+      font-style: italic;
+      font-weight: 400;
+      font-display: block;
+      src: url('https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/fonts/KaTeX_Math-Italic.woff2') format('woff2');
+    }
+    
+    @font-face {
+      font-family: 'KaTeX_Size1';
+      font-style: normal;
+      font-weight: 400;
+      font-display: block;
+      src: url('https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/fonts/KaTeX_Size1-Regular.woff2') format('woff2');
+    }
+    
+    body {
+      font-family: 'Noto Sans Math', 'Cambria Math', 'Times New Roman', Georgia, serif;
+      font-size: 11pt;
+      line-height: 1.7;
+      color: #000;
+      max-width: 100%;
+    }
+    
+    /* Math content font stack */
+    .math-content, .katex, .katex * {
+      font-family: 'KaTeX_Main', 'KaTeX_Math', 'Noto Sans Math', 'Cambria Math', serif;
+    }
+    
+    /* Headings */
+    h1 { 
+      font-size: 18pt; 
+      font-weight: bold; 
+      margin-top: 0.5cm;
+      margin-bottom: 0.3cm;
+      color: #008B8B;
+      border-bottom: 2px solid #008B8B;
+      padding-bottom: 0.2cm;
+      page-break-after: avoid;
+    }
+    h2 { 
+      font-size: 14pt; 
+      font-weight: bold; 
+      margin-top: 0.4cm;
+      margin-bottom: 0.2cm;
+      color: #2E7D32;
+      page-break-after: avoid;
+    }
+    h3 { 
+      font-size: 12pt; 
+      font-weight: bold; 
+      margin-top: 0.3cm;
+      margin-bottom: 0.15cm;
+      color: #333;
+      page-break-after: avoid;
+    }
+    
+    /* Citations */
+    .citation-ref {
+      color: #1976D2;
+      font-weight: bold;
+    }
+    
+    /* Math styling */
+    .katex {
+      font-size: 1.05em;
+    }
+    .katex-display {
+      margin: 0.8em 0;
+      padding: 0.5em;
+      background: rgba(0, 0, 0, 0.02);
+      border-left: 2px solid #4CAF50;
+      page-break-inside: avoid;
+    }
+    .katex-display .katex {
+      font-size: 1.1em;
+    }
+    
+    /* Prevent breaks in math */
+    .katex, .katex-display, .math-content {
+      break-inside: avoid;
+      page-break-inside: avoid;
+    }
+    
+    /* References section */
+    .references-section {
+      margin-top: 0.8cm;
+      padding-top: 0.3cm;
+      border-top: 1px solid #333;
+    }
+    .reference-item {
+      margin-bottom: 0.2cm;
+      font-size: 10pt;
+    }
+    
+    /* Ensure links are black for print */
+    a {
+      color: #000;
+      text-decoration: none;
+    }
+    
+    /* Loading indicator */
+    #font-loading {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      background: #fff;
+      border: 2px solid #4CAF50;
+      border-radius: 8px;
+      padding: 20px 40px;
+      font-size: 14pt;
+      z-index: 9999;
+    }
+    
+    .hidden {
+      display: none !important;
+    }
+  </style>
+</head>
+<body>
+  <div id="font-loading">Loading fonts for PDF...</div>
+  
+  <div class="content" style="visibility: hidden;">
+    ${formattedAnswer}
+  </div>
+  
+  <script>
+    // Wait for fonts to load before showing content
+    async function prepareForPDF() {
+      const loadingDiv = document.getElementById('font-loading');
+      const contentDiv = document.querySelector('.content');
+      
+      try {
+        // Wait for all fonts to load
+        await document.fonts.ready;
+        
+        // Additional wait for KaTeX fonts
+        const katexFonts = [
+          'KaTeX_Main',
+          'KaTeX_Math',
+          'KaTeX_Size1',
+          'Noto Sans Math'
+        ];
+        
+        for (const font of katexFonts) {
+          try {
+            await document.fonts.load('1em "' + font + '"');
+          } catch (e) {
+            console.log('Font load check for ' + font + ':', e);
+          }
+        }
+        
+        // Render KaTeX
+        if (typeof renderMathInElement !== 'undefined') {
+          renderMathInElement(document.body, {
+            delimiters: [
+              {left: '$$', right: '$$', display: true},
+              {left: '$', right: '$', display: false},
+              {left: '\\\\[', right: '\\\\]', display: true},
+              {left: '\\\\(', right: '\\\\)', display: false},
+            ],
+            throwOnError: false,
+            errorColor: '#cc0000'
+          });
+        }
+        
+        // Wait a bit more for KaTeX to finish
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
+        // Show content and hide loading
+        if (loadingDiv) loadingDiv.style.display = 'none';
+        if (contentDiv) contentDiv.style.visibility = 'visible';
+        
+        // Auto-trigger print dialog after fonts loaded
+        setTimeout(() => {
+          window.print();
+        }, 300);
+        
+      } catch (error) {
+        console.error('Font loading error:', error);
+        // Show content anyway
+        if (loadingDiv) loadingDiv.style.display = 'none';
+        if (contentDiv) contentDiv.style.visibility = 'visible';
+        window.print();
+      }
+    }
+    
+    // Start preparation when page loads
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', prepareForPDF);
+    } else {
+      prepareForPDF();
+    }
+  </script>
+</body>
+</html>`;
+    
+    // Open in new window with PDF-optimized content
+    const blob = new Blob([pdfHtml], { type: 'text/html' });
+    const url = URL.createObjectURL(blob);
+    const pdfWindow = window.open(url, '_blank');
+    
+    if (!pdfWindow) {
+      alert('Please allow popups to export PDF.');
+      URL.revokeObjectURL(url);
+    }
+    
+  } catch (error) {
+    console.error('PDF export error:', error);
+    alert('Error preparing PDF. Falling back to standard print.');
+    printAnswer();
+  } finally {
+    // Restore button
+    if (printBtn) {
+      printBtn.textContent = originalText;
+      printBtn.disabled = false;
+    }
   }
 }
 
@@ -497,11 +913,14 @@ function printAnswer(event?: Event): void {
 export function initQueryTab(): void {
   getElement('runQueryBtn')?.addEventListener('click', handleRunQuery);
   getElement('printQueryBtn')?.addEventListener('click', (e) => printAnswer(e));
+  getElement('exportPdfBtn')?.addEventListener('click', () => exportToPDF());
   
   // Clear previous answer when user starts typing a new query
   getElement('queryText')?.addEventListener('input', () => {
     const printBtn = getElement('printQueryBtn');
+    const pdfBtn = getElement('exportPdfBtn');
     if (printBtn) printBtn.style.display = 'none';
+    if (pdfBtn) pdfBtn.style.display = 'none';
     // Don't clear the answer text - let user see it until new query is submitted
   });
   
@@ -646,26 +1065,49 @@ async function handleRunQuery(): Promise<void> {
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   
   try {
-    // Use streaming for Ultra/Comprehensive modes, regular for Quick/Balanced
-    if (isUltra || isComprehensive) {
-      // ========== STREAMING MODE ==========
-      let accumulatedContent = '';
-      let currentProgress = 0;
-      let sectionsCompleted = 0;
-      
-      await sendQueryStreaming(
-        {
-          message: queryText,
-          mode,
-          top_k: detail.top_k,
-          ultra_comprehensive: detail.ultra_comprehensive,
-          detailed: detail.detailed
-        },
-        (event: StreamingEvent) => {
-          switch (event.type) {
-            case 'status':
-              // Update progress message
-              currentProgress = event.progress || currentProgress;
+    // ========== STREAMING MODE FOR ALL MODES ==========
+    // All modes now support streaming for progressive display
+    let accumulatedContent = '';
+    let currentProgress = 0;
+    let sectionsCompleted = 0;
+    
+    await sendQueryStreaming(
+      {
+        message: queryText,
+        mode,
+        top_k: detail.top_k,
+        ultra_comprehensive: detail.ultra_comprehensive,
+        detailed: detail.detailed
+      },
+      (event: StreamingEvent) => {
+        switch (event.type) {
+          case 'status':
+            // Update progress message
+            currentProgress = event.progress ?? currentProgress;
+            console.log('[Progress] Status update:', event.progress, '-> current:', currentProgress, 'message:', event.message);
+            answerText!.innerHTML = `
+              <div class="streaming-status">
+                <div class="progress-bar">
+                  <div class="progress-fill" style="width: ${currentProgress}%"></div>
+                </div>
+                <div class="status-message">
+                  <span class="spinner"></span>
+                  <strong>${event.message}</strong> (${currentProgress}%)
+                </div>
+              </div>
+              ${accumulatedContent ? '<div class="partial-content">' + formatQueryResponse(accumulatedContent) + '</div>' : ''}
+            `;
+            break;
+            
+          case 'content':
+            // Append new content section
+            if (event.content) {
+              accumulatedContent += '\n\n' + event.content;
+              sectionsCompleted++;
+              currentProgress = event.progress ?? currentProgress;
+              console.log('[Progress] Content update:', event.progress, '-> current:', currentProgress, 'section:', event.section);
+              
+              // Update display with partial content
               answerText!.innerHTML = `
                 <div class="streaming-status">
                   <div class="progress-bar">
@@ -673,189 +1115,54 @@ async function handleRunQuery(): Promise<void> {
                   </div>
                   <div class="status-message">
                     <span class="spinner"></span>
-                    <strong>${event.message}</strong> (${currentProgress}%)
+                    <strong>Generated: ${event.section_title || event.section}</strong> (${currentProgress}%)
                   </div>
                 </div>
-                ${accumulatedContent ? '<div class="partial-content">' + formatQueryResponse(accumulatedContent) + '</div>' : ''}
+                <div class="partial-content">${formatQueryResponse(accumulatedContent)}</div>
               `;
-              break;
               
-            case 'content':
-              // Append new content section
-              if (event.content) {
-                accumulatedContent += '\n\n' + event.content;
-                sectionsCompleted++;
-                currentProgress = event.progress || currentProgress;
-                
-                // Update display with partial content
-                answerText!.innerHTML = `
-                  <div class="streaming-status">
-                    <div class="progress-bar">
-                      <div class="progress-fill" style="width: ${currentProgress}%"></div>
-                    </div>
-                    <div class="status-message">
-                      <span class="spinner"></span>
-                      <strong>Generated: ${event.section_title || event.section}</strong> (${currentProgress}%)
-                    </div>
-                  </div>
-                  <div class="partial-content">${formatQueryResponse(accumulatedContent)}</div>
-                `;
-                
-                // Scroll to bottom to show new content
-                answerText!.scrollTop = answerText!.scrollHeight;
-              }
-              break;
+              // Scroll to bottom to show new content
+              answerText!.scrollTop = answerText!.scrollHeight;
+            }
+            break;
+            
+          case 'complete':
+            // Final content received
+            if (event.content) {
+              accumulatedContent = event.content;
+              lastAnswerText = accumulatedContent;
               
-            case 'complete':
-              // Final content received
-              if (event.content) {
-                accumulatedContent = event.content;
-                lastAnswerText = accumulatedContent;
-                
-                // Format and display final content
-                answerText!.innerHTML = formatQueryResponse(accumulatedContent);
-                
-                // Show completion stats
-                const wordCount = event.word_count || accumulatedContent.split(/\s+/).length;
-                sourcesText!.innerHTML = `
-                  <div class="completion-stats">
-                    ✅ <strong>Generation Complete</strong><br>
-                    Word count: ~${wordCount} words<br>
-                    Mode: ${detail.label}
-                  </div>
-                `;
-              }
-              break;
+              // Format and display final content
+              answerText!.innerHTML = formatQueryResponse(accumulatedContent);
               
-            case 'error':
-              throw new Error(event.error || 'Streaming error occurred');
-          }
-        },
-        controller.signal
-      );
-      
-      clearTimeout(timeoutId);
-      if (printBtn) printBtn.style.display = 'inline-block';
-      
-    } else {
-      // ========== NON-STREAMING MODE (Quick/Balanced) ==========
-      const result = await sendQuery({ 
-        message: queryText, 
-        mode,
-        top_k: detail.top_k,
-        ultra_comprehensive: detail.ultra_comprehensive,
-        detailed: detail.detailed
-      }, controller.signal);
-      clearTimeout(timeoutId);
-      
-      const responseText = result.response || result.answer || JSON.stringify(result, null, 2);
-      
-      // Debug: log full result to see what fields are returned
-      console.log('[Query] Full result:', result);
-      console.log('[Query] Result keys:', Object.keys(result));
-      
-      // Store sources and build answer with references for printing
-      const sources = result.sources || result.source_documents || (result as Record<string, unknown>).source || (result as Record<string, unknown>).chunks;
-      if (Array.isArray(sources)) {
-        lastSources = sources.map((s: unknown): string => {
-          if (typeof s === 'string') return s;
-          if (s && typeof s === 'object') {
-            return ((s as Record<string, unknown>).filename as string) || 
-                   ((s as Record<string, unknown>).doc_id as string) || 
-                   ((s as Record<string, unknown>).name as string) || 
-                   JSON.stringify(s);
-          }
-          return String(s);
-        });
-      } else {
-        lastSources = [];
-      }
-      
-      // Extract cited sources
-      const citedSourceNumbers = new Set<number>();
-      const sourceCitations = responseText.match(/Source\s+(\d+)/gi);
-      if (sourceCitations) {
-        sourceCitations.forEach(citation => {
-          const match = citation.match(/\d+/);
-          if (match) {
-            citedSourceNumbers.add(parseInt(match[0], 10));
-          }
-        });
-      }
-      
-      // Build answer with references
-      let answerWithRefs = responseText;
-      if (citedSourceNumbers.size > 0 && lastSources.length > 0) {
-        const citedSources = Array.from(citedSourceNumbers)
-          .sort((a, b) => a - b)
-          .map(num => lastSources[num - 1])
-          .filter(src => src !== undefined);
-        
-        if (citedSources.length > 0) {
-          answerWithRefs += '\n\n\n## References\n\n';
-          citedSources.forEach((src, idx) => {
-            answerWithRefs += `${idx + 1}. ${src}\n`;
-          });
+              // Render any LaTeX math (also handles Unicode math styling)
+              renderMathInElement(answerText!);
+              
+              // Show completion stats
+              const wordCount = event.word_count || accumulatedContent.split(/\s+/).length;
+              sourcesText!.innerHTML = `
+                <div class="completion-stats">
+                  ✅ <strong>Generation Complete</strong><br>
+                  Word count: ~${wordCount} words<br>
+                  Mode: ${detail.label}
+                </div>
+              `;
+            }
+            break;
+            
+          case 'error':
+            throw new Error(event.error || 'Streaming error occurred');
         }
-      }
-      lastAnswerText = answerWithRefs;
+      },
+      controller.signal
+    );
+    
+    clearTimeout(timeoutId);
+    if (printBtn) printBtn.style.display = 'inline-block';
+    const pdfBtn = getElement('exportPdfBtn');
+    if (pdfBtn) pdfBtn.style.display = 'inline-block';
       
-      if (printBtn) printBtn.style.display = 'inline-block';
-      
-      // Check if LLM timed out
-      if (responseText.startsWith('Found') && responseText.includes('relevant chunks')) {
-        renderTimeoutResponse(responseText, answerText!);
-      } else {
-        let displayText = responseText;
-        if (citedSourceNumbers.size > 0 && lastSources.length > 0) {
-          const citedSources = Array.from(citedSourceNumbers)
-            .sort((a, b) => a - b)
-            .map(num => lastSources[num - 1])
-            .filter(src => src !== undefined);
-          
-          if (citedSources.length > 0) {
-            displayText += '\n\n\n## References\n\n' + citedSources.map((src, idx) => `${idx + 1}. ${src}`).join('\n');
-          }
-        }
-        answerText!.innerHTML = formatQueryResponse(displayText);
-        setTimeout(() => renderMathInElement(answerText!), 100);
-      }
-      
-      // Show sources
-      const rawSources = result.sources || result.source_documents;
-      if (lastSources.length > 0) {
-        let sourcesHtml = '';
-        
-        if (citedSourceNumbers.size > 0) {
-          const citedSources = Array.from(citedSourceNumbers)
-            .sort((a, b) => a - b)
-            .map(num => lastSources[num - 1])
-            .filter(src => src !== undefined);
-          
-          if (citedSources.length > 0) {
-            sourcesHtml += `<div class="sources-section references-section">`;
-            sourcesHtml += `<div class="sources-header references-header">📚 References</div>`;
-            citedSources.forEach((src, idx) => {
-              sourcesHtml += `<div class="source-item references-item">${idx + 1}. ${escapeHtml(src)}</div>`;
-            });
-            sourcesHtml += `</div>`;
-          }
-        }
-        
-        sourcesHtml += `<div class="sources-section verification-section">`;
-        sourcesHtml += `<div class="sources-header verification-header">🔍 Sources (for Verification)</div>`;
-        lastSources.forEach((src, idx) => {
-          sourcesHtml += `<div class="source-item verification-item">${idx + 1}. ${escapeHtml(src)}</div>`;
-        });
-        sourcesHtml += `</div>`;
-        
-        sourcesText!.innerHTML = sourcesHtml;
-      } else if (typeof rawSources === 'number') {
-        sourcesText!.innerHTML = `<div class="source-item">Found ${rawSources} sources (filenames not available)</div>`;
-      } else {
-        sourcesText!.textContent = 'No sources available';
-      }
-    }
+    // All modes now use streaming for progressive display
     
   } catch (error) {
     clearTimeout(timeoutId);
@@ -921,11 +1228,16 @@ export function formatQueryResponse(text: string): string {
   // Remove HTML paragraph tags (<p> and </p>)
   cleaned = cleaned.replace(/<\/?p>/gi, '');
   
+  // Convert <i> tags to markdown italics BEFORE processing reference items
+  // This preserves italic formatting in references (e.g., journal names)
+  cleaned = cleaned.replace(/<i>([\s\S]*?)<\/i>/gi, '*$1*');
+  
   // Convert reference-item divs to markdown format BEFORE stripping other divs
-  // Pattern: <div class="reference-item"><span class="ref-number">1.</span> filename</div>
+  // Pattern: <div class="reference-item"><span class="ref-number">1.</span> content</div>
+  // Use [\s\S]*? to match content including any remaining HTML tags
   const beforeRefItems = cleaned;
-  cleaned = cleaned.replace(/<div[^>]*class="reference-item"[^>]*>\s*<span[^>]*class="ref-number"[^>]*>(\d+\.)<\/span>\s*([^<]+)<\/div>/gi, '$1 $2');
-  cleaned = cleaned.replace(/<div[^>]*class="reference-item"[^>]*>\s*(\d+\.)\s*([^<]+)<\/div>/gi, '$1 $2');
+  cleaned = cleaned.replace(/<div[^>]*class="reference-item"[^>]*>\s*<span[^>]*class="ref-number"[^>]*>(\d+\.)<\/span>\s*([\s\S]*?)<\/div>/gi, '$1 $2');
+  cleaned = cleaned.replace(/<div[^>]*class="reference-item"[^>]*>\s*(\d+\.)\s*([\s\S]*?)<\/div>/gi, '$1 $2');
   if (cleaned !== beforeRefItems) {
     console.log('[formatQueryResponse] Converted reference-item divs');
   }
@@ -1121,7 +1433,28 @@ export function formatQueryResponse(text: string): string {
   cleaned = cleaned.replace(/^\* (.+)$/gm, '• $1');
   
   // ======================
-  // STEP 6: Convert to HTML
+  // STEP 6: Enhance Unicode math display
+  // ======================
+  
+  // Wrap lines containing Unicode math symbols in special class for font styling
+  // This ensures math symbols render correctly with proper fonts
+  const unicodeMathPattern = /[∫∂∑∏√∞≈≠≤≥±×÷⟨⟩|ψαβγδεθλμσφω∇∆∈∉∪∩⊂⊃⊆⊇∅∀∃¬∧∨→↔⇒⇔]/;
+  const braKetPattern = /\|[\w]+⟩|⟨[\w]+\||⟨[\w]+\|[\w]+⟩/;
+  
+  cleaned = cleaned.split('\n').map(line => {
+    // Check if line contains Unicode math symbols
+    if (unicodeMathPattern.test(line) || braKetPattern.test(line)) {
+      // Wrap the entire line in unicode-math span
+      // But preserve any existing HTML tags
+      if (!line.trim().startsWith('<')) {
+        return `<span class="unicode-math">${line}</span>`;
+      }
+    }
+    return line;
+  }).join('\n');
+  
+  // ======================
+  // STEP 7: Convert to HTML
   // ==================
   
   // Convert newlines to <br>
@@ -1285,7 +1618,8 @@ export function getQueryTabHTML(): string {
       
       <div style="display: flex; gap: 10px; flex-wrap: wrap;">
         <button id="runQueryBtn" class="btn" aria-label="Submit query">🔍 Ask Question</button>
-        <button type="button" id="printQueryBtn" class="btn" style="padding: 6px 12px; font-size: 13px; display: none;" aria-label="Print answer">🖨️ Print</button>
+        <button type="button" id="printQueryBtn" class="btn" style="padding: 6px 12px; font-size: 13px; display: none;" aria-label="Print answer" title="Open print dialog (for physical printing)">🖨️ Print</button>
+        <button type="button" id="exportPdfBtn" class="btn" style="padding: 6px 12px; font-size: 13px; display: none; background: #4CAF50;" aria-label="Export to PDF" title="Export as PDF with embedded math fonts">📄 PDF</button>
       </div>
       
       <div id="queryResult" style="display: none;" aria-live="polite">
@@ -1307,6 +1641,14 @@ export function getQueryTabHTML(): string {
           line-height: 1.8;
           white-space: pre-wrap;
           word-wrap: break-word;
+          /* Include math fonts for Unicode symbols */
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, 'Noto Sans Math', 'Cambria Math', sans-serif;
+        }
+        
+        /* Unicode math symbols styling */
+        .query-answer .unicode-math {
+          font-family: 'Noto Sans Math', 'Cambria Math', 'STIX Two Math', 'Times New Roman', serif;
+          font-style: normal;
         }
         
         /* Keep math equations on single line */

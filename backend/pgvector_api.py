@@ -1679,7 +1679,8 @@ async def generate_ultra_response(
     num_subsections: int = 3,
     llm_config: dict = None,
     chinese_variant: str = "english",
-    sources: list = None
+    sources: list = None,
+    num_academic_refs: int = 12
 ) -> str:
     """
     Ultra-Deep generation: 2 API calls total (outline + full content).
@@ -1710,7 +1711,19 @@ async def generate_ultra_response(
         lang_instr = "Write in English"
     
     # Build source list
-    source_list = "\n".join([f"[{i+1}] {s.get('source', f'Doc {i+1}')}" for i, s in enumerate(sources[:15])]) if sources else "[1] Knowledge Base Sources"
+    # Build source list including both database sources AND academic reference placeholders
+    num_db_sources = len(sources) if sources else 0
+    db_source_list = "\n".join([f"[{i+1}] {s.get('source', f'Doc {i+1}')}" for i, s in enumerate(sources[:10])]) if sources else "[1] Knowledge Base Sources"
+    
+    # Add academic reference placeholders (the LLM will generate these)
+    # num_academic_refs is now passed as parameter based on mode
+    academic_ref_list = "\n".join([f"[{num_db_sources + i}] Academic Reference {i}" for i in range(1, num_academic_refs + 1)])
+    
+    source_list = f"""DATABASE SOURCES:
+{db_source_list}
+
+ACADEMIC REFERENCES (from LLM knowledge):
+{academic_ref_list}"""
     
     # Step 1: Generate outline (1 API call)
     outline_prompt = f"""Create a detailed outline for: {query}
@@ -2025,7 +2038,7 @@ COMPLETE THE FOLLOWING:
 <query-h2>{references_label}</query-h2>
 <div class="references-list">
 """
-                for i, src in enumerate(sources[:15], 1):
+                for i, src in enumerate(sources[:10], 1):
                     source_name = src.get('source', f'Source {i}').replace('.txt', '').replace('.pdf', '').replace('.md', '')
                     continuation_prompt += f'<div class="reference-item"><span class="ref-number">[{i}]</span> {source_name}</div>\n'
                 continuation_prompt += "</div>\n"
@@ -2080,7 +2093,7 @@ Requirements:
         if references_label not in full_content:
             # Missing entirely - add it
             print(f"[ULTRA] Adding missing References section")
-            ref_entries = "\n".join([f'<div class="reference-item"><span class="ref-number">[{i+1}]</span> <span class="ref-source">{s.get("source", f"Source {i+1}").replace(".txt", "").replace(".pdf", "").replace(".md", "")}</span></div>' for i, s in enumerate(sources[:15])]) if sources else '<div class="reference-item"><span class="ref-number">[1]</span> <span class="ref-source">Knowledge Base</span></div>'
+            ref_entries = "\n".join([f'<div class="reference-item"><span class="ref-number">[{i+1}]</span> <span class="ref-source">{s.get("source", f"Source {i+1}").replace(".txt", "").replace(".pdf", "").replace(".md", "")}</span></div>' for i, s in enumerate(sources[:10])]) if sources else '<div class="reference-item"><span class="ref-number">[1]</span> <span class="ref-source">Knowledge Base</span></div>'
             full_content += f"\n\n<query-h2>{references_label}</query-h2>\n\n<div class=\"references-list\">\n{ref_entries}\n</div>"
         else:
             # Check if existing references section is complete
@@ -2107,16 +2120,18 @@ Requirements:
                     # Remove the truncated references section
                     full_content = re.sub(rf'<query-h2>{references_label}</query-h2>.*?(?=<query-h2>|$)', '', full_content, flags=re.DOTALL)
                     # Add complete references section
-                    ref_entries = "\n".join([f'<div class="reference-item"><span class="ref-number">[{i+1}]</span> <span class="ref-source">{s.get("source", f"Source {i+1}").replace(".txt", "").replace(".pdf", "").replace(".md", "")}</span></div>' for i, s in enumerate(sources[:15])]) if sources else '<div class="reference-item"><span class="ref-number">[1]</span> <span class="ref-source">Knowledge Base</span></div>'
+                    ref_entries = "\n".join([f'<div class="reference-item"><span class="ref-number">[{i+1}]</span> <span class="ref-source">{s.get("source", f"Source {i+1}").replace(".txt", "").replace(".pdf", "").replace(".md", "")}</span></div>' for i, s in enumerate(sources[:10])]) if sources else '<div class="reference-item"><span class="ref-number">[1]</span> <span class="ref-source">Knowledge Base</span></div>'
                     full_content += f"\n\n<query-h2>{references_label}</query-h2>\n\n<div class=\"references-list\">\n{ref_entries}\n</div>"
         
+        # Convert any LaTeX to Unicode before returning
+        full_content = convert_latex_to_unicode(full_content)
         print(f"[ULTRA] Generated content: {len(full_content)} chars, ~{len(full_content.split())} words")
         return full_content
         
     except Exception as e:
         rerank_logger.error(f"Full content generation failed: {e}")
         # Fallback to basic generation
-        return await llm_complete_with_provider(
+        fallback_content = await llm_complete_with_provider(
             prompt=f"Write a comprehensive article about: {query}\n\nContext: {context[:4000]}\n\nTarget: 3000+ words",
             system_prompt=base_system_prompt,
             provider=provider,
@@ -2124,6 +2139,9 @@ Requirements:
             max_tokens=8192,
             temperature=0.4
         )
+        # Convert any LaTeX to Unicode
+        return convert_latex_to_unicode(fallback_content)
+
 async def academic_review_citations(response: str, sources: list, query: str, 
                                    llm_provider: str = "deepseek", 
                                    llm_fallback: str = "minimax") -> tuple:
@@ -4250,7 +4268,8 @@ CRITICAL REQUIREMENTS - NO EXCEPTIONS:
                 query, context, system_prompt, ">3000-4000" if is_ultra else ">2000",
                 num_sections=5 if is_ultra else 4, num_subsections=3,
                 llm_config=llm_config,
-                chinese_variant=chinese_variant
+                chinese_variant=chinese_variant,
+                num_academic_refs=18 if is_ultra else 14  # 16-20 for Ultra, 12-16 for Comprehensive
             )
         except Exception as e:
             print(f"[ERROR] Ultra response generation failed: {e}")
@@ -4822,7 +4841,8 @@ async def chat_with_doc(request: dict):
 @app.post("/api/v1/chat/stream")
 async def chat_stream(request: dict):
     """
-    Streaming version of chat endpoint for Ultra-Deep and Comprehensive modes.
+    Streaming version of chat endpoint for ALL modes.
+    Supports Quick, Balanced, Comprehensive, and Ultra-Deep.
     """
     query = request.get("query") or request.get("message", "")
     mode = request.get("mode", "semantic").lower()
@@ -4830,11 +4850,11 @@ async def chat_stream(request: dict):
     
     is_ultra = request.get("ultra_comprehensive", False)
     is_comprehensive = request.get("detailed", False) or mode == "comprehensive"
-    
-    if not (is_ultra or is_comprehensive):
-        return JSONResponse({
-            "error": "Streaming is only supported for Ultra-Deep and Comprehensive modes"
-        }, status_code=400)
+    top_k = request.get("top_k", 10)
+    # Balanced: top_k >= 20, not ultra/comprehensive
+    # Quick: top_k < 20, not ultra/comprehensive
+    is_balanced = (top_k >= 20) and not (is_ultra or is_comprehensive)
+    is_quick = (top_k < 20) and not (is_ultra or is_comprehensive)
     
     if not query or not query.strip():
         return JSONResponse({
@@ -4867,6 +4887,7 @@ async def chat_stream(request: dict):
     # STRICT FILTERING: Only keep sources with similarity >= 0.7
     similarity_threshold = 0.7
     min_quality_sources = 5
+    max_db_sources = 10  # Increased from default to show more high-quality sources
     
     # Build sources list with deduplication and strict filtering
     sources = []
@@ -4889,7 +4910,7 @@ async def chat_stream(request: dict):
             'content': r.get('content', ''),
             'similarity': similarity
         })
-        if len(sources) >= 15:
+        if len(sources) >= max_db_sources:
             break
     
     # LLM KNOWLEDGE FALLBACK: If fewer than 5 high-quality sources
@@ -4899,24 +4920,208 @@ async def chat_stream(request: dict):
     context = "\n\n".join(context_parts)
     
     async def event_generator():
-        async for chunk in generate_ultra_response_streaming(
-            query=query,
-            context=context,
-            base_system_prompt="You are a senior research scientist writing academic survey papers.",
-            target_words=">2500-3500" if is_ultra else ">1800-2500",
-            num_sections=7 if is_ultra else 5,
-            num_subsections=3,
-            llm_config=llm_config,
-            sources=sources,
-            use_llm_references=use_llm_references
-        ):
-            yield chunk
+        # Mode-specific LLM academic reference counts
+        # Quick: 5-8, Balanced: 8-12, Comprehensive: 12-16, Ultra-Deep: 16-20
+        if is_balanced:
+            # Balanced mode: 4 sections with 3 subsections each, 150+ words per section
+            async for chunk in generate_ultra_response_streaming(
+                query=query,
+                context=context,
+                base_system_prompt="You are a research scientist. Write detailed content with substantial depth.",
+                target_words=">1500-2000",
+                num_sections=4,
+                num_subsections=3,
+                llm_config=llm_config,
+                sources=sources,
+                use_llm_references=use_llm_references,
+                num_academic_refs=10  # 8-12 range, mid-point
+            ):
+                yield chunk
+        elif is_quick:
+            # Quick mode: simpler output with fewer sections
+            async for chunk in generate_ultra_response_streaming(
+                query=query,
+                context=context,
+                base_system_prompt="You are a knowledgeable research assistant.",
+                target_words=">600-1200",
+                num_sections=3,
+                num_subsections=2,
+                llm_config=llm_config,
+                sources=sources,
+                use_llm_references=use_llm_references,
+                num_academic_refs=6  # 5-8 range, mid-point
+            ):
+                yield chunk
+        elif is_comprehensive:
+            # Comprehensive mode: full detailed output
+            async for chunk in generate_ultra_response_streaming(
+                query=query,
+                context=context,
+                base_system_prompt="You are a senior research scientist writing academic survey papers.",
+                target_words=">1800-2500",
+                num_sections=5,
+                num_subsections=3,
+                llm_config=llm_config,
+                sources=sources,
+                use_llm_references=use_llm_references,
+                num_academic_refs=14  # 12-16 range, mid-point
+            ):
+                yield chunk
+        else:
+            # Ultra-Deep mode: maximum detail
+            async for chunk in generate_ultra_response_streaming(
+                query=query,
+                context=context,
+                base_system_prompt="You are a senior research scientist writing academic survey papers.",
+                target_words=">2500-3500",
+                num_sections=7,
+                num_subsections=3,
+                llm_config=llm_config,
+                sources=sources,
+                use_llm_references=use_llm_references,
+                num_academic_refs=18  # 16-20 range, mid-point
+            ):
+                yield chunk
     
     return StreamingResponse(
         event_generator(),
         media_type="application/x-ndjson",
         headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
     )
+
+
+def convert_latex_to_unicode(text: str) -> str:
+    """
+    Convert common LaTeX math expressions to Unicode equivalents.
+    This is a post-processing fallback in case the LLM generates LaTeX despite instructions.
+    """
+    if not text:
+        return text
+    
+    # Define LaTeX to Unicode replacements
+    # Note: In raw strings, \ represents a literal backslash
+    replacements = [
+        # Inline and display math delimiters - must be first
+        (r'\\\((.*?)\\\)', r'\1'),  # \( ... \) -> content only
+        (r'\\\[(.*?)\\\]', r'\1'),  # \[ ... \] -> content only
+        (r'\$\$(.*?)\$\$', r'\1'),  # $$ ... $$ -> content only
+        (r'\$(.*?)\$', r'\1'),  # $ ... $ -> content only
+        
+        # Greek letters (lowercase)
+        (r'\\alpha\b', 'α'),
+        (r'\\beta\b', 'β'),
+        (r'\\gamma\b', 'γ'),
+        (r'\\delta\b', 'δ'),
+        (r'\\epsilon\b', 'ε'),
+        (r'\\theta\b', 'θ'),
+        (r'\\lambda\b', 'λ'),
+        (r'\\mu\b', 'μ'),
+        (r'\\sigma\b', 'σ'),
+        (r'\\phi\b', 'φ'),
+        (r'\\varphi\b', 'φ'),
+        (r'\\omega\b', 'ω'),
+        (r'\\psi\b', 'ψ'),
+        (r'\\pi\b', 'π'),
+        (r'\\tau\b', 'τ'),
+        (r'\\rho\b', 'ρ'),
+        (r'\\chi\b', 'χ'),
+        (r'\\eta\b', 'η'),
+        (r'\\kappa\b', 'κ'),
+        (r'\\nu\b', 'ν'),
+        (r'\\xi\b', 'ξ'),
+        (r'\\zeta\b', 'ζ'),
+        
+        # Greek letters (uppercase)
+        (r'\\Gamma\b', 'Γ'),
+        (r'\\Delta\b', 'Δ'),
+        (r'\\Theta\b', 'Θ'),
+        (r'\\Lambda\b', 'Λ'),
+        (r'\\Sigma\b', 'Σ'),
+        (r'\\Phi\b', 'Φ'),
+        (r'\\Omega\b', 'Ω'),
+        (r'\\Psi\b', 'Ψ'),
+        (r'\\Pi\b', 'Π'),
+        
+        # Common math operators and symbols
+        (r'\\sum\b', '∑'),
+        (r'\\prod\b', '∏'),
+        (r'\\int\b', '∫'),
+        (r'\\partial\b', '∂'),
+        (r'\\nabla\b', '∇'),
+        (r'\\infty\b', '∞'),
+        (r'\\in\b', '∈'),
+        (r'\\notin\b', '∉'),
+        (r'\\subset\b', '⊂'),
+        (r'\\supset\b', '⊃'),
+        (r'\\subseteq\b', '⊆'),
+        (r'\\supseteq\b', '⊇'),
+        (r'\\cup\b', '∪'),
+        (r'\\cap\b', '∩'),
+        (r'\\emptyset\b', '∅'),
+        (r'\\forall\b', '∀'),
+        (r'\\exists\b', '∃'),
+        (r'\\neg\b', '¬'),
+        (r'\\wedge\b', '∧'),
+        (r'\\vee\b', '∨'),
+        (r'\\rightarrow\b', '→'),
+        (r'\\leftarrow\b', '←'),
+        (r'\\Rightarrow\b', '⇒'),
+        (r'\\Leftarrow\b', '⇐'),
+        (r'\\leftrightarrow\b', '↔'),
+        (r'\\Leftrightarrow\b', '⇔'),
+        (r'\\times\b', '×'),
+        (r'\\div\b', '÷'),
+        (r'\\pm\b', '±'),
+        (r'\\mp\b', '∓'),
+        (r'\\leq\b', '≤'),
+        (r'\\geq\b', '≥'),
+        (r'\\neq\b', '≠'),
+        (r'\\approx\b', '≈'),
+        (r'\\sim\b', '∼'),
+        (r'\\propto\b', '∝'),
+        (r'\\cdot\b', '·'),
+        (r'\\dots\b', '…'),
+        (r'\\ldots\b', '…'),
+        (r'\\cdots\b', '⋯'),
+        (r'\\vdots\b', '⋮'),
+        (r'\\ddots\b', '⋱'),
+        
+        # Brackets and delimiters
+        (r'\\langle\b', '⟨'),
+        (r'\\rangle\b', '⟩'),
+        (r'\\\|', '‖'),  # Escaped \|
+        (r'\\\{', '{'),  # Escaped \{
+        (r'\\\}', '}'),  # Escaped \}
+        
+        # Fractions and roots
+        (r'\\frac\{([^}]+)\}\{([^}]+)\}', r'\1/\2'),  # Simple fraction conversion
+        (r'\\sqrt\{([^}]+)\}', r'√\1'),  # Square root
+        (r'\\sqrt\[([^\]]+)\]\{([^}]+)\}', r'\1√\2'),  # nth root
+        
+        # Subscripts and superscripts (simplified) - be careful not to break citations like [1]
+        (r'_\{([^}]+)\}', r'\1'),  # Remove subscript braces
+        (r'\^\{([^}]+)\}', r'\1'),  # Remove superscript braces
+        
+        # Common text commands
+        (r'\\text\{([^}]+)\}', r'\1'),  # Remove \text{...}
+        (r'\\mathrm\{([^}]+)\}', r'\1'),  # Remove \mathrm{...}
+        (r'\\mathbf\{([^}]+)\}', r'\1'),  # Remove \mathbf{...}
+        (r'\\mathit\{([^}]+)\}', r'\1'),  # Remove \mathit{...}
+        (r'\\textbf\{([^}]+)\}', r'\1'),  # Remove \textbf{...}
+        (r'\\textit\{([^}]+)\}', r'\1'),  # Remove \textit{...}
+    ]
+    
+    import re
+    result = text
+    for pattern, replacement in replacements:
+        try:
+            result = re.sub(pattern, replacement, result)
+        except Exception as e:
+            # If a regex fails, continue with other replacements
+            print(f"[LaTeX Conversion Warning] Pattern '{pattern}' failed: {e}")
+            continue
+    
+    return result
 
 
 async def generate_ultra_response_streaming(
@@ -4929,7 +5134,8 @@ async def generate_ultra_response_streaming(
     llm_config: dict = None,
     chinese_variant: str = "english",
     sources: list = None,
-    use_llm_references: bool = False
+    use_llm_references: bool = False,
+    num_academic_refs: int = 12
 ):
     """Streaming version of Ultra-Deep generation."""
     if llm_config is None:
@@ -4954,7 +5160,19 @@ async def generate_ultra_response_streaming(
         references_label = "References"
         lang_instr = "Write in English"
     
-    source_list = "\n".join([f"[{i+1}] {s.get('source', f'Doc {i+1}')}" for i, s in enumerate(sources[:15])]) if sources else "[1] Knowledge Base Sources"
+    # Build source list including both database sources AND academic reference placeholders
+    num_db_sources = len(sources) if sources else 0
+    db_source_list = "\n".join([f"[{i+1}] {s.get('source', f'Doc {i+1}')}" for i, s in enumerate(sources[:10])]) if sources else "[1] Knowledge Base Sources"
+    
+    # Add academic reference placeholders (the LLM will generate these)
+    # num_academic_refs comes from function parameter (mode-specific)
+    academic_ref_list = "\n".join([f"[{num_db_sources + i}] Academic Reference {i}" for i in range(1, num_academic_refs + 1)])
+    
+    source_list = f"""DATABASE SOURCES:
+{db_source_list}
+
+ACADEMIC REFERENCES (from LLM knowledge):
+{academic_ref_list}"""
     
     yield json.dumps({"type": "status", "stage": "outline", "message": "Creating outline...", "progress": 0}) + "\n"
     
@@ -5025,11 +5243,12 @@ AVAILABLE SOURCES FOR CITATION:
 
 CITATION REQUIREMENTS - CRITICAL:
 1. Use EXACT format: <span class="citation-ref">[N]</span>
-2. Cite at least 8+ DIFFERENT sources like [1], [2], [3], [4], [5], [6], [7], [8]
-3. VARY between sources - do NOT use [1] repeatedly
+2. Cite at least 8+ DIFFERENT sources
+3. MIX database sources [1]-[{num_db_sources}] AND academic references [{num_db_sources + 1}]-[{num_db_sources + num_academic_refs}]
+4. VARY between sources - do NOT use [1] repeatedly
 
-CORRECT (VARIED citations):
-"Research shows management affects outcomes <span class="citation-ref">[1]</span>. Studies indicate motivation drives engagement <span class="citation-ref">[3]</span>. Participation reinforces learning <span class="citation-ref">[5]</span>."
+CORRECT (MIXED citations):
+"Research from corporate data shows outcomes <span class="citation-ref">[1]</span>. Academic studies indicate engagement patterns <span class="citation-ref">[{num_db_sources + 1}]</span>. Further evidence demonstrates <span class="citation-ref">[3]</span>. Recent scholarship highlights <span class="citation-ref">[{num_db_sources + 4}]</span> (example for {num_academic_refs} academic refs)."
 
 WRONG (REPEATING [1]):
 "Research shows management <span class="citation-ref">[1]</span>. Motivation drives engagement <span class="citation-ref">[1]</span>. Participation <span class="citation-ref">[1]</span>."
@@ -5037,18 +5256,21 @@ WRONG (REPEATING [1]):
 Requirements:
 - 300+ words
 - Use <query-h2>{exec_summary_label}</query-h2>
-- Cite at least 8+ DIFFERENT sources - vary between [1] through [12]
-- Flowing paragraphs only, no bullet points"""
+- Cite at least 8+ DIFFERENT sources from both database AND academic references
+- Flowing paragraphs only, no bullet points
+- MATH: Use Unicode |ψ⟩, α, β, ∑, ⟨, ⟩ - NEVER LaTeX"""
 
     try:
         exec_summary = await llm_complete_with_provider(
             prompt=exec_prompt,
-            system_prompt=f"Write comprehensive content. Use ONLY HTML tags. {lang_instr}",
+            system_prompt=f"Write comprehensive content. Use ONLY HTML tags. MATH: Use Unicode symbols (|ψ⟩, α, β, ∑, ⟨, ⟩) NEVER LaTeX. {lang_instr}",
             provider=provider,
             fallback_provider=fallback,
             max_tokens=4000,
             temperature=0.3
         )
+        # Convert any LaTeX to Unicode
+        exec_summary = convert_latex_to_unicode(exec_summary)
         full_content_parts.append(exec_summary)
         yield json.dumps({"type": "content", "section": "executive_summary", "content": exec_summary, "progress": 15}) + "\n"
     except Exception as e:
@@ -5073,12 +5295,13 @@ AVAILABLE SOURCES FOR CITATION:
 CITATION REQUIREMENTS - CRITICAL:
 1. Use EXACT format: <span class="citation-ref">[N]</span>
 2. Include 3-5 citations from DIFFERENT sources per subsection
-3. VARY between sources [1] through [8] and beyond - do NOT repeat [1]
+3. MIX database sources [1]-[{num_db_sources}] AND academic references [{num_db_sources + 1}]-[{num_db_sources + num_academic_refs}]
+4. VARY between sources - do NOT repeat [1]
 
-CORRECT (VARIED):
-"Research shows... <span class="citation-ref">[1]</span>. Further studies indicate... <span class="citation-ref">[3]</span>. Additional evidence... <span class="citation-ref">[5]</span>."
+CORRECT (MIXED citations):
+"Research from corporate data shows... <span class="citation-ref">[1]</span>. Academic studies indicate... <span class="citation-ref">[{num_db_sources + 2}]</span>. Further evidence from literature... <span class="citation-ref">[{num_db_sources + 5}]</span>."
 
-WRONG (REPEATING):
+WRONG (REPEATING same source):
 "Research shows... <span class="citation-ref">[1]</span>. Further studies... <span class="citation-ref">[1]</span>. Additional... <span class="citation-ref">[1]</span>."
 
 Write using EXACT format:
@@ -5088,7 +5311,7 @@ Write using EXACT format:
         for sub_idx, sub_title in enumerate(section['subsections'][:num_subsections], 1):
             batch_prompt += f"""
 <query-h3>{idx}.{sub_idx} {sub_title}</query-h3>
-[150+ words with 3-5 citations from DIFFERENT sources]
+[150+ words with 3-5 citations from DIFFERENT sources - MIX database and academic refs]
 """
         
         batch_prompt += f"""
@@ -5096,18 +5319,21 @@ CRITICAL RULES:
 1. Use EXACT tags: <query-h2>{idx}. ...</query-h2> and <query-h3>{idx}.1 ...</query-h3>
 2. Citation format: <span class="citation-ref">[N]</span> ONLY
 3. Write 150+ words per subsection with 3-5 citations
-4. VARY citation numbers [1] through [8] - NEVER use [1] repeatedly
-5. NO bullet points - flowing paragraphs only"""
+4. CITE BOTH database sources [1]-[{num_db_sources}] AND academic refs [{num_db_sources + 1}]-[{num_db_sources + 12}]
+5. NO bullet points - flowing paragraphs only
+6. MATH: Use Unicode |ψ⟩, α, β, ∑, ⟨, ⟩ - NEVER LaTeX"""
 
         try:
             batch_content = await llm_complete_with_provider(
                 prompt=batch_prompt,
-                system_prompt=f"Write comprehensive academic content. Use ONLY HTML tags. {lang_instr}",
+                system_prompt=f"Write comprehensive academic content. Use ONLY HTML tags. MATH: Use Unicode symbols (|ψ⟩, α, β, ∑, ⟨, ⟩) NEVER LaTeX. {lang_instr}",
                 provider=provider,
                 fallback_provider=fallback,
                 max_tokens=8192,
                 temperature=0.3
             )
+            # Convert any LaTeX to Unicode
+            batch_content = convert_latex_to_unicode(batch_content)
             full_content_parts.append(batch_content)
             yield json.dumps({"type": "content", "section": f"section_{idx}", "section_title": section['title'], "content": batch_content, "progress": int(progress)}) + "\n"
         except Exception as e:
@@ -5125,10 +5351,11 @@ AVAILABLE SOURCES FOR CITATION:
 CITATION REQUIREMENTS - CRITICAL:
 1. Use EXACT format: <span class="citation-ref">[N]</span>
 2. Include citations from at least 8+ DIFFERENT sources
-3. VARY between sources [1], [2], [3], [4], [5], [6], [7], [8] - do NOT repeat [1]
+3. MIX database sources [1]-[{num_db_sources}] AND academic references [{num_db_sources + 1}]-[{num_db_sources + num_academic_refs}]
+4. VARY between sources - do NOT repeat [1]
 
-CORRECT (VARIED citations):
-"Management affects outcomes <span class="citation-ref">[1]</span>. Motivation drives engagement <span class="citation-ref">[3]</span>. Participation reinforces learning <span class="citation-ref">[5]</span>."
+CORRECT (MIXED citations):
+"Management affects outcomes <span class="citation-ref">[1]</span>. Academic research on motivation shows engagement patterns <span class="citation-ref">[{num_db_sources + 1}]</span>. Database evidence indicates participation reinforces learning <span class="citation-ref">[3]</span>. Recent scholarship highlights leadership dynamics <span class="citation-ref">[{num_db_sources + 4}]</span>."
 
 WRONG (REPEATING [1]):
 "Management affects outcomes <span class="citation-ref">[1]</span>. Motivation drives engagement <span class="citation-ref">[1]</span>. Participation <span class="citation-ref">[1]</span>."
@@ -5136,19 +5363,22 @@ WRONG (REPEATING [1]):
 Requirements:
 - 400+ words
 - Use <query-h2>{conclusion_label}</query-h2>
-- Cite at least 8+ DIFFERENT sources - vary between [1] through [12]
+- Cite at least 8+ DIFFERENT sources from BOTH database and academic references
 - Synthesize key insights
-- NO bullet points - flowing paragraphs only"""
+- NO bullet points - flowing paragraphs only
+- MATH: Use Unicode |ψ⟩, α, β, ∑, ⟨, ⟩ - NEVER LaTeX"""
 
     try:
         conclusion = await llm_complete_with_provider(
             prompt=concl_prompt,
-            system_prompt=f"Write comprehensive conclusion. Use ONLY HTML tags. {lang_instr}",
+            system_prompt=f"Write comprehensive conclusion. Use ONLY HTML tags. MATH: Use Unicode symbols (|ψ⟩, α, β, ∑, ⟨, ⟩) NEVER LaTeX. {lang_instr}",
             provider=provider,
             fallback_provider=fallback,
             max_tokens=4000,
             temperature=0.3
         )
+        # Convert any LaTeX to Unicode
+        conclusion = convert_latex_to_unicode(conclusion)
         full_content_parts.append(conclusion)
         yield json.dumps({"type": "content", "section": "conclusion", "content": conclusion, "progress": 95}) + "\n"
     except Exception as e:
@@ -5158,49 +5388,82 @@ Requirements:
     # References
     yield json.dumps({"type": "status", "stage": "references", "message": "Generating References...", "progress": 98}) + "\n"
     
-    if use_llm_references or len(sources) < 5:
-        # LLM KNOWLEDGE FALLBACK: Generate proper academic references from its knowledge
-        ref_prompt = f"""You MUST generate proper academic references from your knowledge in APA format for an article about: {query}
+    # ALWAYS generate LLM academic references to supplement database sources
+    # This ensures all citations in the content have corresponding references
+    num_db_sources = len(sources) if sources else 0
+    
+    # Build database sources list
+    db_refs_html = ""
+    if sources:
+        db_ref_items = [f'<div class="reference-item"><span class="ref-number">[{i}]</span> {s["source"]}</div>' for i, s in enumerate(sources[:10], 1)]
+        db_refs_html = "\n".join(db_ref_items)
+    
+    # Generate LLM academic references (always, to supplement database sources)
+    # num_academic_refs comes from function parameter (mode-specific)
+    ref_prompt = f"""Generate proper ACADEMIC REFERENCES from your knowledge in APA format for an article about: {query}
 
-CRITICAL INSTRUCTION:
-- Database sources are insufficient (fewer than 5 high-quality sources found)
-- You MUST generate proper academic references from your knowledge
-- Use your training knowledge to create realistic, credible academic citations
+DATABASE SOURCES ALREADY AVAILABLE:
+{chr(10).join([f"[{i+1}] {s['source']}" for i, s in enumerate(sources[:10])]) if sources else "(No database sources)"}
 
-Requirements:
-- Generate 8-12 proper academic references from your knowledge in APA format
+INSTRUCTION:
+- Generate {num_academic_refs} additional academic references from your training knowledge
+- These should complement any database sources listed above
+- Use proper APA seventh edition format: Author, A. A. (Year). Title. Source. DOI/URL
 - Include peer-reviewed journals, books, and conference papers
-- Use proper APA 7th edition format: Author, A. A. (Year). Title. Source. DOI/URL
 - Mix of classic and recent publications (2010-2024)
-- Ensure references are relevant to the topic and academically credible
+- Numbering should continue from database sources: start at [{num_db_sources + 1}]
 
 Output format:
-<query-h2>📚 {references_label}</query-h2>
-<div class="references-list">
-<div class="reference-item"><span class="ref-number">[1]</span> Author, A. A. (Year). <i>Title of work</i>. Publisher. https://doi.org/...</div>
-[Continue with at least 8 references in proper APA format]
-</div>"""
-        try:
-            llm_references = await llm_complete_with_provider(
-                prompt=ref_prompt,
-                system_prompt=f"You are an academic research assistant. Generate proper academic references from your knowledge in APA format. The database has insufficient sources, so you MUST create credible, realistic academic citations from your training knowledge. Use ONLY HTML tags. {lang_instr}",
-                provider=provider,
-                fallback_provider=fallback,
-                max_tokens=2000,
-                temperature=0.3
-            )
-            references = llm_references
-        except Exception as e:
-            # Fallback to basic references
-            ref_items = [f'<div class="reference-item"><span class="ref-number">[{i}]</span> {s["source"]}</div>' for i, s in enumerate(sources[:10], 1)] if sources else ['<div class="reference-item">[1] Knowledge Base</div>']
-            references = f"\n<query-h2>📚 {references_label}</query-h2>\n<div class=\"references-list\">\n" + "\n".join(ref_items) + "\n</div>"
-    elif sources:
-        ref_items = []
-        for i, s in enumerate(sources[:10], 1):
-            ref_items.append(f'<div class="reference-item"><span class="ref-number">[{i}]</span> {s["source"]}</div>')
-        references = f"\n<query-h2>📚 {references_label}</query-h2>\n<div class=\"references-list\">\n" + "\n".join(ref_items) + "\n</div>"
-    else:
-        references = f"\n<query-h2>📚 {references_label}</query-h2>\n<div class=\"references-list\"><div class=\"reference-item\">[1] Knowledge Base</div></div>"
+<div class="reference-item"><span class="ref-number">[{num_db_sources + 1}]</span> Author, A. A. (Year). Title. Source.</div>
+[Continue with {num_academic_refs} references in proper APA format, numbered sequentially from {num_db_sources + 1} to {num_db_sources + num_academic_refs}]
+"""
+    try:
+        llm_references = await llm_complete_with_provider(
+            prompt=ref_prompt,
+            system_prompt=f"You are an academic research assistant. Generate credible academic references from your training knowledge in APA format. Number them to continue from any existing database sources. Use ONLY HTML tags. {lang_instr}",
+            provider=provider,
+            fallback_provider=fallback,
+            max_tokens=2000,
+            temperature=0.3
+        )
+        
+        # Extract reference items from LLM response
+        import re
+        llm_ref_items = re.findall(r'<div class="reference-item">.*?</div>', llm_references, re.DOTALL)
+        
+        if not llm_ref_items:
+            # If LLM didn't format properly, try to extract lines with reference patterns
+            lines = llm_references.split('\n')
+            llm_ref_items = [line.strip() for line in lines if f'[{num_db_sources + 1}]' in line or f'[{num_db_sources + 2}]' in line]
+            # Wrap in div if needed
+            llm_ref_items = [f'<div class="reference-item">{item}</div>' if not item.startswith('<div') else item for item in llm_ref_items]
+        
+        # Combine database + LLM academic references
+        all_refs = []
+        if db_refs_html:
+            all_refs.append(db_refs_html)
+        all_refs.extend(llm_ref_items[:num_academic_refs])
+        
+        # Join all references
+        references_html = "\n".join(all_refs)
+        
+        # Convert markdown italics *text* to HTML <i>text</i> for proper rendering
+        # This handles journal names, conference names, etc. in APA format
+        references_html = re.sub(r'\*([^*]+)\*', r'<i>\1</i>', references_html)
+        
+        references = f"\n<query-h2>📚 {references_label}</query-h2>\n<div class=\"references-list\">\n" + references_html + "\n</div>"
+        
+    except Exception as e:
+        logger.error(f"[LLM References] Error generating academic references: {e}")
+        # Fallback: use database sources only
+        if sources:
+            ref_items = [f'<div class="reference-item"><span class="ref-number">[{i}]</span> {s["source"]}</div>' for i, s in enumerate(sources[:10], 1)]
+            references_html = "\n".join(ref_items)
+            # Convert markdown italics to HTML
+            references_html = re.sub(r'\*([^*]+)\*', r'<i>\1</i>', references_html)
+            references = f"\n<query-h2>📚 {references_label}</query-h2>\n<div class=\"references-list\">\n" + references_html + "\n</div>"
+        else:
+            references = f"\n<query-h2>📚 {references_label}</query-h2>\n<div class=\"references-list\"><div class=\"reference-item\">[1] Knowledge Base</div></div>"
     
     full_content_parts.append(references)
     yield json.dumps({"type": "content", "section": "references", "content": references, "progress": 99}) + "\n"
