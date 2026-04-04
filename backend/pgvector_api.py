@@ -297,6 +297,36 @@ def keyword_score(query: str, text: str) -> float:
     matches = sum(1 for w in query_words if w in text_lower)
     return matches / len(query_words)
 
+
+# ============ Language Detection Helper ============
+
+def get_language_instruction(query: str) -> str:
+    """
+    Detect query language and return explicit instruction for the LLM to write in that language.
+    """
+    import re
+
+    has_chinese = bool(re.search(r'[\u4e00-\u9fff]', query))
+    has_japanese = bool(re.search(r'[\u3040-\u309f\u30a0-\u30ff]', query))
+    has_korean = bool(re.search(r'[\uac00-\ud7af]', query))
+
+    # Detect Traditional vs Simplified Chinese
+    trad_chars = r'[們員問學國過長從來時後無嗎讓愛會體與進說問們員來時國過長從們區義產點裡歲術]'
+    simp_chars = r'[们员问学国过长从来时后无吗让爱会体与进说们员来时国过长从们区义产点里岁术]'
+    has_traditional = bool(re.search(trad_chars, query))
+    has_simplified = bool(re.search(simp_chars, query))
+
+    if has_japanese:
+        return "CRITICAL: Write the ENTIRE answer in Japanese. All section headers, content, titles must be in Japanese. 参考文献 (References) section can use source filenames."
+    elif has_korean:
+        return "CRITICAL: Write the ENTIRE answer in Korean. All section headers, content, titles must be in Korean. 참고문헌 (References) section can use source filenames."
+    elif has_traditional or (has_chinese and not has_simplified):
+        return "CRITICAL: Write the ENTIRE answer in Traditional Chinese (繁體中文). All section headers, content, titles must use Traditional Chinese characters. 參考文獻 (References) section can use source filenames. 禁止使用簡體字。"
+    elif has_chinese:
+        return "CRITICAL: Write the ENTIRE answer in Simplified Chinese (简体中文). All section headers, content, titles must use Simplified Chinese characters. 參考文獻 (References) section can use source filenames."
+    else:
+        return "CRITICAL: Write the ENTIRE answer in English. All section headers, content, titles must be in English."
+
 def calculate_recency_score(created_at: Optional[datetime]) -> float:
     """Calculate recency score for chunks."""
     if not created_at:
@@ -1823,22 +1853,32 @@ async def generate_ultra_response(
     
     rerank_logger.info(f"[ULTRA] Starting generation for '{query[:50]}...'")
     
-    # Language setup
+    # Language setup - use more explicit language instruction
     if chinese_variant == "traditional":
         exec_summary_label = "摘要"
         conclusion_label = "結論"
         references_label = "參考文獻"
-        lang_instr = "使用繁體中文撰寫"
+        lang_instr = "CRITICAL: Write the ENTIRE answer in Traditional Chinese (繁體中文). All section headers, content, titles, and body text must use Traditional Chinese characters. 參考文獻 section can use source filenames. 禁止使用簡體字。"
     elif chinese_variant == "simplified":
         exec_summary_label = "摘要"
         conclusion_label = "结论"
         references_label = "参考文献"
-        lang_instr = "使用简体中文撰写"
+        lang_instr = "CRITICAL: Write the ENTIRE answer in Simplified Chinese (简体中文). All section headers, content, titles, and body text must use Simplified Chinese characters. 参考文献 section can use source filenames."
+    elif chinese_variant == "japanese":
+        exec_summary_label = "概要"
+        conclusion_label = "結論"
+        references_label = "参考文献"
+        lang_instr = "CRITICAL: Write the ENTIRE answer in Japanese. All section headers, content, titles, and body text must be in Japanese."
+    elif chinese_variant == "korean":
+        exec_summary_label = "개요"
+        conclusion_label = "결론"
+        references_label = "참고문헌"
+        lang_instr = "CRITICAL: Write the ENTIRE answer in Korean. All section headers, content, titles, and body text must be in Korean."
     else:
         exec_summary_label = "Executive Summary"
         conclusion_label = "Conclusion"
         references_label = "References"
-        lang_instr = "Write in English"
+        lang_instr = "CRITICAL: Write the ENTIRE answer in English. All section headers, content, titles, and body text must be in English."
     
     # Build source list
     # Build source list including both database sources AND academic reference placeholders
@@ -3924,64 +3964,78 @@ async def chat(request: dict):
         context_parts.append(f"[Source {i+1}: {source} | Relevance: {score:.2f}]\n{content}")
     
     context = source_legend + "\n\n---\n\n".join(context_parts)
-    
+
     # Clean up the context - remove excessive formatting
     context = re.sub(r'╮╯╭╰━┃╱╲╳╔╗╚╝║═╠╬╣╝╚', '', context)
     context = re.sub(r'─{3,}', '', context)
     context = re.sub(r'│{2,}', '', context)
     context = context.strip()
-    
-    # Source relevance check - ENABLED for all modes with smart filtering
-    # For Ultra/Comprehensive: Keep high-similarity chunks even if filename doesn't match
-    # For Quick/Balanced: Stricter filename-based filtering
+
     is_ultra = request.get("ultra_comprehensive", False)
     is_comprehensive = request.get("detailed", False)
-    
-    # Get unique sources and apply relevance filtering
+
+    # CRITICAL: Check if MAX similarity score is below threshold
+    # If no sources have similarity >= 0.7, fall back to LLM knowledge - NO internal sources used
+    SIMILARITY_THRESHOLD = 0.7
+    max_similarity = 0.0
+    if filtered_result:
+        for r in filtered_result:
+            score = r.get('rerank_score', r.get('similarity', 0))
+            if score > max_similarity:
+                max_similarity = score
+
+    print(f"[INFO] Max similarity score: {max_similarity:.4f} (threshold: {SIMILARITY_THRESHOLD})")
+
+    if max_similarity < SIMILARITY_THRESHOLD:
+        # No relevant sources found - fall back to LLM knowledge
+        print(f"[WARNING] No sources with similarity >= {SIMILARITY_THRESHOLD}. Max score: {max_similarity:.4f}")
+        print(f"[INFO] Falling back to LLM knowledge - no internal sources will be used")
+        try:
+            fallback_response = await generate_llm_knowledge_response(
+                query,
+                llm_config={"provider": llm_provider, "fallback_provider": llm_fallback},
+                is_ultra=is_ultra,
+                is_comprehensive=is_comprehensive
+            )
+            if fallback_response:
+                return {
+                    "response": fallback_response,
+                    "answer": fallback_response,
+                    "sources": [],
+                    "confidence": 0.7,
+                    "retrieval_info": {
+                        "method": "llm_knowledge_only",
+                        "note": f"All {len(filtered_result)} retrieved chunks have similarity < {SIMILARITY_THRESHOLD}. Answer generated from LLM pre-trained knowledge."
+                    }
+                }
+        except Exception as e:
+            print(f"[ERROR] LLM knowledge generation failed: {e}")
+
+    # If we reach here, max_similarity >= 0.7, so we have relevant sources
+    # Get unique sources and apply semantic relevance filtering
     unique_sources_check = list(set([r.get("source", "unknown") for r in filtered_result]))
     irrelevant_sources_check = []
     relevant_sources_check = []
-    
+
     for src in unique_sources_check:
         is_rel, _ = is_source_relevant(src, query)
         if is_rel:
             relevant_sources_check.append(src)
         else:
             irrelevant_sources_check.append(src)
-    
-    # Smart filtering based on mode
-    if is_ultra or is_comprehensive:
-        # Ultra/Comprehensive: Keep sources with decent rerank scores (>0.4) even if filename doesn't match
-        # This preserves high-quality vector matches while filtering obvious noise
-        high_quality_threshold = 0.4
-        rescued_sources = []
-        
-        for src in irrelevant_sources_check:
-            # Find chunks from this source
-            src_chunks = [r for r in filtered_result if r.get('source') == src]
-            # Check if any chunk has high rerank score
-            max_score = max([r.get('rerank_score', 0) for r in src_chunks], default=0)
-            if max_score >= high_quality_threshold:
-                rescued_sources.append(src)
-                print(f"[INFO] Rescued source '{src}' due to high vector similarity ({max_score:.2f} > {high_quality_threshold})")
-        
-        relevant_sources_check.extend(rescued_sources)
-        irrelevant_sources_check = [s for s in irrelevant_sources_check if s not in rescued_sources]
-        
-        print(f"[INFO] Ultra/Comprehensive mode: {len(relevant_sources_check)} sources kept, {len(irrelevant_sources_check)} filtered out")
-    
+
     # Apply filtering
     if irrelevant_sources_check:
-        if len(irrelevant_sources_check) == len(unique_sources_check) and not (is_ultra or is_comprehensive):
-            # If ALL sources would be filtered AND not Ultra/Comprehensive, fall back to LLM knowledge
-            print(f"[WARNING] All {len(unique_sources_check)} sources are irrelevant to query: {query}")
-            print(f"[INFO] Skipping RAG, generating directly from LLM knowledge")
+        if len(irrelevant_sources_check) == len(unique_sources_check):
+            # All sources failed semantic relevance check despite high vector similarity
+            print(f"[WARNING] All sources failed semantic relevance check despite max_similarity >= {SIMILARITY_THRESHOLD}")
+            print(f"[INFO] Returning LLM knowledge response with empty sources")
             try:
                 fallback_response = await generate_llm_knowledge_response(
                     query,
                     llm_config={"provider": llm_provider, "fallback_provider": llm_fallback},
-                    is_ultra=False,
-                    is_comprehensive=False
+                    is_ultra=is_ultra,
+                    is_comprehensive=is_comprehensive
                 )
                 if fallback_response:
                     return {
@@ -3991,25 +4045,11 @@ async def chat(request: dict):
                         "confidence": 0.7,
                         "retrieval_info": {
                             "method": "llm_knowledge_only",
-                            "note": f"Retrieved {len(filtered_result)} chunks but source relevance check failed. Answer generated from LLM pre-trained knowledge."
+                            "note": f"Retrieved chunks have high vector similarity but ALL sources failed semantic relevance check. Answer generated from LLM pre-trained knowledge."
                         }
                     }
             except Exception as e:
                 print(f"[ERROR] LLM knowledge generation failed: {e}")
-        elif len(irrelevant_sources_check) == len(unique_sources_check) and (is_ultra or is_comprehensive):
-            # Ultra/Comprehensive: Keep top 10 sources by rerank score even if all would be filtered
-            print(f"[WARNING] All {len(unique_sources_check)} sources would be filtered, but Ultra/Comprehensive mode - keeping top sources by relevance")
-            # Sort sources by max rerank score and keep top 10
-            source_scores = {}
-            for src in unique_sources_check:
-                src_chunks = [r for r in filtered_result if r.get('source') == src]
-                max_score = max([r.get('rerank_score', 0) for r in src_chunks], default=0)
-                source_scores[src] = max_score
-            
-            top_sources = sorted(source_scores.items(), key=lambda x: x[1], reverse=True)[:10]
-            relevant_sources_check = [src for src, score in top_sources]
-            irrelevant_sources_check = []
-            print(f"[INFO] Ultra/Comprehensive mode: Keeping top {len(relevant_sources_check)} sources by relevance score")
         else:
             print(f"[INFO] Filtered out {len(irrelevant_sources_check)} irrelevant sources, keeping {len(relevant_sources_check)} relevant ones")
             # Filter filtered_result to only keep relevant sources
@@ -4713,24 +4753,24 @@ async def generate_llm_knowledge_response(query: str, llm_config: dict = None, i
     """
     import os
     import re
-    
+
     # Get LLM provider from config
     if llm_config is None:
         llm_config = {}
     provider = llm_config.get("provider", "deepseek")
     fallback = llm_config.get("fallback_provider")
-    
+
     # Detect language for headers
     has_chinese = bool(re.search(r'[\u4e00-\u9fff]', query))
     has_japanese = bool(re.search(r'[\u3040-\u309f\u30a0-\u30ff]', query))
     has_korean = bool(re.search(r'[\uac00-\ud7af]', query))
-    
+
     # Detect Traditional vs Simplified Chinese
     trad_chars = r'[們員問學國過長從來時後無嗎讓愛會體與進說問們員來時國過長從們區義產點裡歲術]'
     simp_chars = r'[们员问学国过长从来时后无吗让爱会体与进说们员来时国过长从们区义产点里岁术]'
     has_traditional = bool(re.search(trad_chars, query))
     has_simplified = bool(re.search(simp_chars, query))
-    
+
     if has_japanese:
         chinese_variant = "japanese"
     elif has_korean:
@@ -4741,20 +4781,15 @@ async def generate_llm_knowledge_response(query: str, llm_config: dict = None, i
         chinese_variant = "simplified"
     else:
         chinese_variant = "english"
-    
+
+    # Get explicit language instruction
+    language_instruction = get_language_instruction(query)
+
     # For Ultra/Comprehensive modes, use generate_ultra_response with no context
     if is_ultra or is_comprehensive:
         # Create minimal context for the function
         context = f"User query: {query}\n\nNo relevant documents found in knowledge base. Generate answer from your training knowledge."
-        
-        # Build system prompt
-        if chinese_variant == "traditional":
-            language_instruction = "使用繁體中文（台灣/香港用字）撰寫，例如：「這裡」、「們」、「員」、「問」、「學」、「國」、「過」、「長」、「從」、「來」、「時」、「後」、「無」、「嗎」、「讓」、「愛」、「會」、「體」、「與」、「進」、「說」。禁止使用簡體字。"
-        elif chinese_variant == "simplified":
-            language_instruction = "使用简体中文撰写。"
-        else:
-            language_instruction = "Write in English."
-            
+
         system_prompt = f"""You are a senior research scientist writing comprehensive academic survey papers.
 
 CRITICAL HTML FORMAT REQUIREMENTS:
@@ -4769,9 +4804,8 @@ CRITICAL REQUIREMENTS - NO EXCEPTIONS:
 - NEVER output main section content without subsections - subsections are REQUIRED
 - Each subsection must be 200+ words (6-10 sentences minimum)
 - Write in flowing PARAGRAPHS ONLY - NEVER use bullet points
-- Write in same language as user's question
 - {language_instruction}"""
-        
+
         try:
             return await generate_ultra_response(
                 query, context, system_prompt, ">3000-4000" if is_ultra else ">2000",
@@ -4827,7 +4861,9 @@ Structure:
 [Summary and key takeaways]
 """
 
-    system_prompt = "You are an expert providing comprehensive technical information. Write authoritatively based on your knowledge. Do not cite specific sources. Do not add any disclaimer notes about how the answer was generated. Just provide the direct answer."
+    system_prompt = f"""You are an expert providing comprehensive technical information. Write authoritatively based on your knowledge. Do not cite specific sources. Do not add any disclaimer notes about how the answer was generated. Just provide the direct answer.
+
+{language_instruction}"""
     
     try:
         # Use provider-aware LLM completion
@@ -5667,7 +5703,54 @@ async def chat_stream(request: dict):
             break
     
     print(f"[chat_stream] AFTER filtering at {relevance_threshold}: {len(sources)} sources (mode={mode}, ultra={is_ultra})")
-    
+
+    # CRITICAL: Check semantic relevance of sources
+    # Even if vector similarity is high, verify source filename/content is actually relevant to query
+    semantically_relevant_sources = []
+    for src in sources:
+        is_rel, reason = is_source_relevant(src['source'], query)
+        if is_rel:
+            semantically_relevant_sources.append(src)
+            print(f"[INFO] Source '{src['source']}' is semantically relevant: {reason}")
+        else:
+            print(f"[WARNING] Source '{src['source']}' has high vector score ({src['similarity']:.3f}) but is semantically irrelevant: {reason}")
+
+    # If ALL sources are semantically irrelevant, fall back to LLM knowledge
+    if len(semantically_relevant_sources) == 0 and len(sources) > 0:
+        print(f"[WARNING] All {len(sources)} sources have high vector scores but are semantically irrelevant to query")
+        print(f"[INFO] Falling back to LLM knowledge - no internal sources will be used")
+
+        # Generate answer from LLM knowledge without database sources - USE STREAMING
+        async def llm_only_generator():
+            try:
+                # Use the streaming function directly for true streaming behavior
+                # Pass empty context and sources to use LLM knowledge only
+                async for chunk in generate_ultra_response_streaming(
+                    query=query,
+                    context="",  # No database context
+                    base_system_prompt="You are a senior research scientist writing comprehensive academic survey papers.",
+                    target_words=">3000-4000" if is_ultra else ">2000",
+                    num_sections=7 if is_ultra else 5,
+                    num_subsections=3,
+                    llm_config=llm_config,
+                    sources=[],  # No database sources
+                    use_llm_references=True,  # Generate academic references from LLM knowledge
+                    num_academic_refs=18 if is_ultra else 14
+                ):
+                    yield chunk
+            except Exception as e:
+                print(f"[ERROR] LLM knowledge streaming failed: {e}")
+                yield json.dumps({"type": "error", "message": str(e)}) + "\n"
+
+        return StreamingResponse(
+            llm_only_generator(),
+            media_type="application/x-ndjson",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
+        )
+
+    # Use only semantically relevant sources
+    sources = semantically_relevant_sources
+
     # LLM KNOWLEDGE FALLBACK: If fewer than 5 high-quality sources
     use_llm_references = len(sources) < min_quality_sources
     
@@ -5887,7 +5970,7 @@ async def generate_ultra_response_streaming(
     num_sections: int = 5,
     num_subsections: int = 3,
     llm_config: dict = None,
-    chinese_variant: str = "english",
+    chinese_variant: str = None,  # Auto-detect if not provided
     sources: list = None,
     use_llm_references: bool = False,
     num_academic_refs: int = 12
@@ -5897,23 +5980,56 @@ async def generate_ultra_response_streaming(
         llm_config = {}
     provider = llm_config.get("provider", "deepseek")
     fallback = llm_config.get("fallback_provider")
-    
-    # Language setup
+
+    # Auto-detect language from query if not provided
+    if chinese_variant is None:
+        import re
+        has_chinese = bool(re.search(r'[\u4e00-\u9fff]', query))
+        has_japanese = bool(re.search(r'[\u3040-\u309f\u30a0-\u30ff]', query))
+        has_korean = bool(re.search(r'[\uac00-\ud7af]', query))
+
+        trad_chars = r'[們員問學國過長從來時後無嗎讓愛會體與進說問們員來時國過長從們區義產點裡歲術]'
+        simp_chars = r'[们员问学国过长从来时后无吗让爱会体与进说们员来时国过长从们区义产点里岁术]'
+        has_traditional = bool(re.search(trad_chars, query))
+        has_simplified = bool(re.search(simp_chars, query))
+
+        if has_japanese:
+            chinese_variant = "japanese"
+        elif has_korean:
+            chinese_variant = "korean"
+        elif has_traditional or (has_chinese and not has_simplified):
+            chinese_variant = "traditional"
+        elif has_chinese:
+            chinese_variant = "simplified"
+        else:
+            chinese_variant = "english"
+
+    # Language setup - use more explicit language instruction
     if chinese_variant == "traditional":
         exec_summary_label = "摘要"
         conclusion_label = "結論"
         references_label = "參考文獻"
-        lang_instr = "使用繁體中文撰寫"
+        lang_instr = "CRITICAL: Write the ENTIRE answer in Traditional Chinese (繁體中文). All section headers, content, titles, and body text must use Traditional Chinese characters. 參考文獻 section can use source filenames. 禁止使用簡體字。"
     elif chinese_variant == "simplified":
         exec_summary_label = "摘要"
         conclusion_label = "结论"
         references_label = "参考文献"
-        lang_instr = "使用简体中文撰写"
+        lang_instr = "CRITICAL: Write the ENTIRE answer in Simplified Chinese (简体中文). All section headers, content, titles, and body text must use Simplified Chinese characters. 参考文献 section can use source filenames."
+    elif chinese_variant == "japanese":
+        exec_summary_label = "概要"
+        conclusion_label = "結論"
+        references_label = "参考文献"
+        lang_instr = "CRITICAL: Write the ENTIRE answer in Japanese. All section headers, content, titles, and body text must be in Japanese."
+    elif chinese_variant == "korean":
+        exec_summary_label = "개요"
+        conclusion_label = "결론"
+        references_label = "참고문헌"
+        lang_instr = "CRITICAL: Write the ENTIRE answer in Korean. All section headers, content, titles, and body text must be in Korean."
     else:
         exec_summary_label = "Executive Summary"
         conclusion_label = "Conclusion"
         references_label = "References"
-        lang_instr = "Write in English"
+        lang_instr = "CRITICAL: Write the ENTIRE answer in English. All section headers, content, titles, and body text must be in English."
     
     # Build source list including both database sources AND academic reference placeholders
     num_db_sources = len(sources) if sources else 0
