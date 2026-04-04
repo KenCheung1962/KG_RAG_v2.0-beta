@@ -786,6 +786,60 @@ class KGStorage:
             logger.error(traceback.format_exc())
             return []
     
+    async def search_chunks_diverse(
+        self,
+        query_vector: List[float],
+        limit: int = 10,
+        min_similarity: float = 0.5,
+        max_per_source: int = 2
+    ) -> List[SearchResult]:
+        """Search chunks with source diversity - gets top chunks from different sources.
+        
+        Uses DISTINCT ON to get the best chunk from each source first, then
+        fills remaining slots with next best from each source up to max_per_source.
+        """
+        vector_str = '[' + ','.join(str(x) for x in query_vector) + ']'
+        
+        # Query to get top chunks per source using window function
+        query = """
+        WITH ranked_chunks AS (
+            SELECT 
+                chunk_id,
+                content,
+                source,
+                metadata,
+                1 - (embedding <=> $1::vector) as similarity,
+                ROW_NUMBER() OVER (PARTITION BY source ORDER BY embedding <=> $1::vector) as rank
+            FROM chunks
+            WHERE embedding IS NOT NULL
+              AND LENGTH(TRIM(content)) > 0
+              AND 1 - (embedding <=> $1::vector) >= $2
+        )
+        SELECT chunk_id, content, source, metadata, similarity
+        FROM ranked_chunks
+        WHERE rank <= $3
+        ORDER BY similarity DESC
+        LIMIT $4
+        """
+        
+        try:
+            rows = await self.client.fetch(query, vector_str, min_similarity, max_per_source, limit)
+            return [
+                SearchResult(
+                    chunk_id=str(row["chunk_id"]),
+                    content=str(row["content"]),
+                    source=str(row["source"]) if row["source"] else None,
+                    similarity=float(row["similarity"]),
+                    metadata=json.loads(row["metadata"]) if row.get("metadata") else {}
+                )
+                for row in rows
+            ]
+        except Exception as e:
+            logger.error(f"Failed to search chunks with diversity: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return []
+    
     async def batch_create_chunks(self, chunks: List[Chunk]) -> Dict[str, Any]:
         """Create multiple chunks in batch."""
         if not chunks:

@@ -3,12 +3,11 @@
 > vite
 
 
-  VITE v5.4.21  ready in 345 ms
+  VITE v5.4.21  ready in 184 ms
 
   ➜  Local:   http://localhost:8081/
   ➜  Network: http://10.0.1.12:8081/
-12:06:31 PM [vite] http proxy error: /health
-AggregateError [ECONNREFUSED]: 
-    at internalConnectMultiple (node:net:1134:18)
-    at afterConnectMultiple (node:net:1715:7)
-10:17:27 PM [vite] page reload src/api/client.ts
+10:57:17 PM [vite] page reload src/api/client.ts
+10:57:30 PM [vite] page reload src/components/tabs/QueryTab.ts
+10:59:33 PM [vite] page reload src/components/tabs/QueryTab.ts
+11:02:56 PM [vite] hmr update /src/styles.css

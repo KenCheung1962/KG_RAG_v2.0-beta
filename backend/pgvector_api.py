@@ -45,6 +45,136 @@ except ImportError:
         raise Exception("LLM provider module not available")
     print("[WARNING] minimax_fixed not available - entity extraction will fail")
 
+
+# =============================================================================
+# SHARED: LLM ENTITY EXTRACTION AND SEMANTIC MATCHING
+# =============================================================================
+
+async def extract_and_match_entities(query: str, query_embedding: List[float], llm_config: dict, logger) -> tuple:
+    """
+    Extract entities from query using LLM and match them with database entities using semantic similarity.
+
+    Args:
+        query: The user's query
+        query_embedding: Pre-computed embedding of the query
+        llm_config: LLM configuration
+        logger: Logger instance for debug output
+
+    Returns:
+        tuple: (matched_entities, query_relationships)
+            - matched_entities: List of database entities matching the extracted entities
+            - query_relationships: List of relationships extracted from query
+    """
+    SIMILARITY_THRESHOLD = 0.7
+    MAX_SEED_ENTITIES = 15
+
+    # Use LLM to extract entities and relationships from the query
+    entity_extraction_prompt = f"""Extract KEY ENTITIES and RELATIONSHIPS from this query: "{query}"
+
+Rules:
+- Only extract NOUNS and ENTITY PHRASES (things, concepts, technologies, etc.)
+- DO NOT extract question words (how, what, why, when, where, which, who)
+- DO NOT extract verbs (use, implement, build, create, explain, describe)
+- DO NOT extract articles (the, a, an) or prepositions (to, of, in, for, with)
+
+Output format (JSON):
+{{
+    "entities": ["entity1", "entity2", "entity3"],
+    "relationships": ["entity1 -> entity2", "entity2 -> entity3"]
+}}
+
+Extract the key entities (max 5) and relationships from this query:"""
+
+    query_entities = []
+    query_relationships = []
+
+    try:
+        llm_response = await llm_complete_with_provider(
+            prompt=entity_extraction_prompt,
+            llm_config=llm_config,
+            max_tokens=500,
+            system_prompt="You are a knowledge graph expert. Extract entities and relationships from queries. Always output valid JSON."
+        )
+
+        # Parse LLM response
+        json_match = re.search(r'\{[\s\S]*\}', llm_response)
+        if json_match:
+            try:
+                extraction = json.loads(json_match.group())
+                query_entities = extraction.get('entities', [])
+                query_relationships = extraction.get('relationships', [])
+                logger.info(f"[Entity-Match] LLM extracted entities: {query_entities}")
+            except json.JSONDecodeError as e:
+                logger.warning(f"[Entity-Match] Failed to parse LLM entity extraction: {e}")
+    except Exception as e:
+        logger.warning(f"[Entity-Match] LLM entity extraction failed: {e}")
+
+    if not query_entities:
+        return [], []
+
+    # Map: extracted_entity -> list of matched db_entities (with similarity > threshold)
+    entity_matches = {}  # extracted_entity -> [(db_entity, similarity), ...]
+
+    for extracted_entity in query_entities:
+        try:
+            # Create embedding for the extracted entity
+            entity_embedding = get_ollama_embedding(extracted_entity)
+
+            # Search database entities using the entity embedding
+            from storage import DistanceMetric
+            matched_db_entities = await storage.search_entities(
+                query_vector=entity_embedding,
+                limit=20,
+                distance_metric=DistanceMetric.COSINE
+            )
+
+            # Filter entities with similarity > threshold
+            matches = []
+            for db_entity in matched_db_entities:
+                sim = db_entity.get('similarity', 0)
+                if sim > SIMILARITY_THRESHOLD:
+                    matches.append((db_entity, sim))
+                    logger.info(f"[Entity-Match] '{extracted_entity}' matched '{db_entity.get('name', '')[:30]}' with similarity {sim:.3f}")
+
+            entity_matches[extracted_entity] = matches
+            logger.info(f"[Entity-Match] Entity '{extracted_entity}' matched {len(matches)} database entities (sim > {SIMILARITY_THRESHOLD})")
+
+        except Exception as e:
+            logger.warning(f"[Entity-Match] Failed to match entity '{extracted_entity}': {e}")
+            entity_matches[extracted_entity] = []
+
+    # Collect all matched db entities
+    matched_entities = []
+    all_matched_ids = set()
+
+    for extracted_entity, matches in entity_matches.items():
+        for db_entity, sim in matches:
+            entity_id = db_entity.get('entity_id')
+            if entity_id and entity_id not in all_matched_ids:
+                all_matched_ids.add(entity_id)
+                # Boost similarity based on how many extracted entities it matched
+                num_matches = sum(1 for m in entity_matches.values()
+                                 if any(e.get('entity_id') == entity_id for e, _ in m))
+
+                if num_matches >= 2:
+                    db_entity['similarity'] = sim * 1.5
+                    db_entity['matched_from'] = extracted_entity
+                    db_entity['num_entity_matches'] = num_matches
+                    logger.info(f"[Entity-Match] PAIRED: '{db_entity.get('name', '')[:40]}' matched {num_matches} extracted entities")
+                else:
+                    db_entity['similarity'] = sim * 1.2
+                    db_entity['matched_from'] = extracted_entity
+
+                matched_entities.append(db_entity)
+
+    # Sort by similarity and limit
+    matched_entities.sort(key=lambda x: x.get('similarity', 0), reverse=True)
+    matched_entities = matched_entities[:MAX_SEED_ENTITIES]
+
+    logger.info(f"[Entity-Match] Total: {len(matched_entities)} seed entities matched (from {len(all_matched_ids)} unique)")
+    return matched_entities, query_relationships
+
+
 # =============================================================================
 # RERANKER CONFIGURATION
 # =============================================================================
@@ -2369,12 +2499,15 @@ async def search_smart(
     query: str,
     query_embedding: List[float],
     top_k: int = 20,
-    llm_config: dict = None
+    llm_config: dict = None,
+    use_rerank: bool = True,
+    rerank_method: str = "hybrid"
 ) -> List[Dict]:
     """
     SMART Mode: Multi-layer unified search combining ALL embedding types and strategies.
-    
+
     Layers:
+    0. LLM Entity Extraction & Semantic Matching (NEW - extract entities and match with database)
     1. Semantic Chunk Search (primary foundation)
     2. Entity Discovery & Expansion (entity embeddings)
     3. Relationship Enhancement (relationship embeddings)
@@ -2382,10 +2515,41 @@ async def search_smart(
     5. Multi-source Fusion & Intelligent Ranking
     """
     logger.info(f"[Smart] Starting multi-layer unified search for: {query[:50]}...")
-    
+
     from storage import DistanceMetric
     all_chunks = []
-    
+    matched_entities = []  # Store matched entities for later use
+
+    # =================================================================
+    # LAYER 0: LLM ENTITY EXTRACTION & SEMANTIC MATCHING (NEW)
+    # =================================================================
+    try:
+        matched_entities, _ = await extract_and_match_entities(query, query_embedding, llm_config, logger)
+        logger.info(f"[Smart] Layer 0 - LLM matched entities: {len(matched_entities)}")
+
+        # Use matched entities to get chunks directly
+        for entity in matched_entities[:10]:  # Top 10 matched entities
+            try:
+                entity_id = entity.get('entity_id')
+                if entity_id:
+                    chunks = await storage.get_chunks_by_entity(entity_id, limit=10)
+                    for chunk in chunks:
+                        all_chunks.append({
+                            'content': chunk.content,
+                            'source': chunk.source,
+                            'chunk_id': chunk.chunk_id,
+                            'entity_id': entity_id,
+                            'similarity': entity.get('similarity', 0.7),  # Use matched entity similarity
+                            'source_layer': 'llm_entity_match',
+                            'base_score': entity.get('similarity', 0.7)
+                        })
+            except Exception as e:
+                logger.warning(f"[Smart] Layer 0 - Failed to get chunks for entity {entity_id}: {e}")
+
+        logger.info(f"[Smart] Layer 0 - Added chunks from matched entities")
+    except Exception as e:
+        logger.warning(f"[Smart] Layer 0 (LLM entity extraction) failed: {e}")
+
     # =================================================================
     # LAYER 1: SEMANTIC CHUNK SEARCH (Foundation)
     # =================================================================
@@ -2394,24 +2558,24 @@ async def search_smart(
             query_vector=query_embedding,
             limit=top_k * 2,  # Get more for fusion
             distance_metric=DistanceMetric.COSINE,
-            match_threshold=0.25
+            match_threshold=0.5
         )
-        
+
         for chunk in chunk_results:
             all_chunks.append({
                 'content': chunk.content,
                 'source': chunk.source,
                 'chunk_id': chunk.chunk_id,
-                'entity_id': chunk.entity_id,
+                'entity_id': getattr(chunk, 'entity_id', None),  # May not exist for chunk search
                 'similarity': chunk.similarity,
                 'source_layer': 'semantic_chunk',
                 'base_score': chunk.similarity
             })
-        
+
         logger.info(f"[Smart] Layer 1 - Semantic chunks: {len(chunk_results)}")
     except Exception as e:
         logger.warning(f"[Smart] Layer 1 failed: {e}")
-    
+
     # =================================================================
     # LAYER 2: ENTITY DISCOVERY (Entity Embeddings)
     # =================================================================
@@ -2565,11 +2729,17 @@ async def search_smart(
             pass
     
     logger.info(f"[Smart] Layer 5 - Entity chunks from {len(all_entity_ids)} entities")
-    
+
     # =================================================================
     # FINAL: INTELLIGENT FUSION & RANKING
     # =================================================================
-    
+
+    # DEBUG: Log total chunks before diversity filtering
+    total_unique_chunks = len(all_chunks)
+    total_unique_sources = len(set(c.get('source', 'unknown') for c in all_chunks))
+    print(f"[DEBUG] [Smart] Total chunks before deduplication: {total_unique_chunks}")
+    print(f"[DEBUG] [Smart] Total unique sources before deduplication: {total_unique_sources}")
+
     # Deduplicate
     seen_content = set()
     unique_chunks = []
@@ -2595,14 +2765,44 @@ async def search_smart(
     # Sort by final similarity
     unique_chunks.sort(key=lambda x: x.get('similarity', 0), reverse=True)
     
+    # Ensure source diversity - prioritize chunks from different sources
+    # This ensures we don't get all chunks from just a few highly similar documents
+    seen_sources = set()
+    diverse_chunks = []
+    remaining_chunks = []
+    
+    # First pass: get at least one chunk from each unique source (up to top_k sources)
+    for chunk in unique_chunks:
+        source = chunk.get('source', 'unknown')
+        if source not in seen_sources and len(diverse_chunks) < top_k:
+            seen_sources.add(source)
+            diverse_chunks.append(chunk)
+        else:
+            remaining_chunks.append(chunk)
+    
+    # Second pass: fill remaining slots with highest similarity chunks
+    slots_remaining = top_k - len(diverse_chunks)
+    if slots_remaining > 0:
+        diverse_chunks.extend(remaining_chunks[:slots_remaining])
+    
     # Log distribution
     layer_counts = {}
-    for chunk in unique_chunks[:top_k]:
+    for chunk in diverse_chunks:
         layer = chunk.get('source_layer', 'unknown')
         layer_counts[layer] = layer_counts.get(layer, 0) + 1
     
-    logger.info(f"[Smart] Returning {len(unique_chunks[:top_k])} chunks. Distribution: {layer_counts}")
-    return unique_chunks[:top_k]
+    logger.info(f"[Smart] Returning {len(diverse_chunks)} diverse chunks from {len(seen_sources)} unique sources. Distribution: {layer_counts}")
+    
+    # Apply reranking if enabled
+    if use_rerank and diverse_chunks and rerank_method != "none":
+        try:
+            logger.info(f"[Smart] Reranking {len(diverse_chunks)} chunks using method: {rerank_method}")
+            diverse_chunks = await rerank_chunks(query, diverse_chunks, method=rerank_method, final_k=top_k)
+            logger.info(f"[Smart] Reranking complete, returning top {len(diverse_chunks)} chunks")
+        except Exception as e:
+            logger.warning(f"[Smart] Reranking failed: {e}, using original order")
+    
+    return diverse_chunks
 
 
 async def extract_keywords_for_search(query: str, llm_config: dict = None) -> tuple:
@@ -2641,20 +2841,55 @@ async def search_entity_lookup(
     query: str,
     query_embedding: List[float],
     top_k: int = 20,
-    llm_config: dict = None
+    llm_config: dict = None,
+    use_rerank: bool = True,
+    rerank_method: str = "hybrid"
 ) -> List[Dict]:
     """
     Entity-lookup mode: Comprehensive search using ALL embedding types:
+    - LLM Entity Extraction & Semantic Matching (NEW): Extract entities and match with database
     - Entity embeddings (primary): Find matching entities
     - Relationship embeddings (enhancement): Find related entities via relationships
     - Chunk embeddings (content): Direct vector search on chunks + entity chunks
     - Keywords (boosting): Extract and match keywords for precision
     """
     logger.info(f"[Entity-lookup] Starting comprehensive search for: {query[:50]}...")
-    
+
     from storage import DistanceMetric
     all_chunks = []
-    
+    all_entity_ids = set()
+
+    # =================================================================
+    # LAYER 0: LLM ENTITY EXTRACTION & SEMANTIC MATCHING (NEW)
+    # =================================================================
+    try:
+        matched_entities, _ = await extract_and_match_entities(query, query_embedding, llm_config, logger)
+        logger.info(f"[Entity-lookup] Layer 0 - LLM matched entities: {len(matched_entities)}")
+
+        # Use matched entities to get chunks directly
+        for entity in matched_entities[:10]:  # Top 10 matched entities
+            try:
+                entity_id = entity.get('entity_id')
+                if entity_id:
+                    all_entity_ids.add(entity_id)
+                    chunks = await storage.get_chunks_by_entity(entity_id, limit=15)
+                    for chunk in chunks:
+                        all_chunks.append({
+                            'content': chunk.content,
+                            'source': chunk.source,
+                            'chunk_id': chunk.chunk_id,
+                            'entity_id': entity_id,
+                            'similarity': entity.get('similarity', 0.7),
+                            'source_layer': 'llm_entity_match',
+                            'base_score': entity.get('similarity', 0.7)
+                        })
+            except Exception as e:
+                logger.warning(f"[Entity-lookup] Layer 0 - Failed to get chunks for entity {entity_id}: {e}")
+
+        logger.info(f"[Entity-lookup] Layer 0 - Added chunks from {len(matched_entities[:10])} matched entities")
+    except Exception as e:
+        logger.warning(f"[Entity-lookup] Layer 0 (LLM entity extraction) failed: {e}")
+
     # =================================================================
     # LAYER 1: ENTITY EMBEDDINGS - Find matching entities
     # =================================================================
@@ -2663,22 +2898,22 @@ async def search_entity_lookup(
         limit=top_k * 3,
         distance_metric=DistanceMetric.COSINE
     )
-    
+
     if entity_results:
         logger.info(f"[Entity-lookup] Found {len(entity_results)} entities via entity embeddings")
-    
+
     # =================================================================
     # LAYER 2: KEYWORD EXTRACTION - For entity boosting
     # =================================================================
     high_level, low_level = await extract_keywords_for_search(query, llm_config)
     logger.info(f"[Entity-lookup] Keywords - HL: {high_level[:5]}, LL: {low_level[:5]}")
-    
+
     # Boost entity scores based on keyword matches
     boosted_entities = []
     for entity in entity_results:
         entity_name = entity.get('name', '').lower()
         entity_desc = (entity.get('description') or '').lower()
-        
+
         boost = 0.0
         # Low-level keywords (entity names) get strong boost
         for kw in low_level:
@@ -2687,12 +2922,12 @@ async def search_entity_lookup(
                 boost += 0.15
             elif kw_lower in entity_desc:
                 boost += 0.08
-        
+
         # High-level keywords (concepts) get medium boost
         for kw in high_level:
             if kw.lower() in entity_desc:
                 boost += 0.05
-        
+
         entity['similarity'] = entity.get('similarity', 0.5) + boost
         boosted_entities.append(entity)
     
@@ -2767,7 +3002,7 @@ async def search_entity_lookup(
                 'content': chunk.content,
                 'source': chunk.source,
                 'chunk_id': chunk.chunk_id,
-                'entity_id': chunk.entity_id,
+                'entity_id': getattr(chunk, 'entity_id', None),  # May not exist for chunk search
                 'similarity': chunk.similarity,
                 'source_type': 'chunk_embedding'
             })
@@ -2775,38 +3010,66 @@ async def search_entity_lookup(
         logger.info(f"[Entity-lookup] Added {len(chunk_results)} chunks via direct chunk embeddings")
     except Exception as e:
         logger.warning(f"[Entity-lookup] Chunk embedding search failed: {e}")
-    
+
     # 4b: Chunks from entity-based search (entity + related entities)
+    # AND LOGIC: Track which entities each chunk belongs to
     all_entity_ids = set(e.get('entity_id') for e in top_entities)
     all_entity_ids.update(related_entity_ids)
-    
+
+    # First pass: Collect chunks and track which entities they belong to
+    chunk_to_entities = {}  # chunk_id -> set of entity_ids
+    chunk_data = {}  # chunk_id -> chunk info (for later retrieval)
+
     for entity_id in all_entity_ids:
         try:
             chunks = await storage.get_chunks_by_entity(entity_id, limit=15)
             for chunk in chunks:
-                base_similarity = 0.6
-                
-                # Boost if from top entity
-                if entity_id in [e.get('entity_id') for e in top_entities]:
-                    entity_match = next((e for e in top_entities if e.get('entity_id') == entity_id), None)
-                    if entity_match:
-                        base_similarity = entity_match.get('similarity', 0.7)
-                
-                # Boost if from relationship-expanded entity
-                if entity_id in relationship_boost:
-                    base_similarity += relationship_boost[entity_id]
-                
-                all_chunks.append({
-                    'content': chunk.content,
-                    'source': chunk.source,
-                    'chunk_id': chunk.chunk_id,
-                    'entity_id': entity_id,
-                    'similarity': base_similarity,
-                    'source_type': 'entity_chunk'
-                })
+                chunk_id = chunk.chunk_id
+                if chunk_id not in chunk_to_entities:
+                    chunk_to_entities[chunk_id] = set()
+                    chunk_data[chunk_id] = chunk
+
+                chunk_to_entities[chunk_id].add(entity_id)
         except Exception as e:
             logger.warning(f"[Entity-lookup] Failed to get chunks for {entity_id}: {e}")
-    
+
+    logger.info(f"[Entity-lookup] AND logic: {len(chunk_to_entities)} unique chunks from {len(all_entity_ids)} entities")
+
+    # Second pass: Only include chunks that belong to 2+ different entities (AND logic)
+    # This ensures chunks are relevant to multiple entities (more precise)
+    min_entity_count = 2  # Require chunk to be associated with at least 2 entities
+
+    for chunk_id, entity_ids in chunk_to_entities.items():
+        if len(entity_ids) >= min_entity_count:
+            chunk = chunk_data[chunk_id]
+            # Calculate similarity based on all associated entities
+            base_similarity = 0.6
+
+            # Boost based on top entities
+            for eid in entity_ids:
+                if eid in [e.get('entity_id') for e in top_entities]:
+                    entity_match = next((e for e in top_entities if e.get('entity_id') == eid), None)
+                    if entity_match:
+                        base_similarity = max(base_similarity, entity_match.get('similarity', 0.7))
+                # Boost based on relationship-expanded entities
+                if eid in relationship_boost:
+                    base_similarity += relationship_boost[eid]
+
+            # Additional boost for chunks from multiple entities (more confident)
+            base_similarity += (len(entity_ids) - 1) * 0.05
+
+            all_chunks.append({
+                'content': chunk.content,
+                'source': chunk.source,
+                'chunk_id': chunk.chunk_id,
+                'entity_id': list(entity_ids),  # Store all associated entities
+                'similarity': base_similarity,
+                'source_type': 'entity_chunk',
+                'entity_count': len(entity_ids)  # How many entities this chunk belongs to
+            })
+
+    logger.info(f"[Entity-lookup] After AND filtering: {len(all_chunks)} chunks (required 2+ entities per chunk)")
+
     # =================================================================
     # LAYER 5: RELATIONSHIP CONTENT - Add relationship descriptions
     # =================================================================
@@ -2840,9 +3103,40 @@ async def search_entity_lookup(
     
     unique_chunks.sort(key=lambda x: x.get('similarity', 0), reverse=True)
     
-    logger.info(f"[Entity-lookup] Returning {len(unique_chunks[:top_k])} unique chunks "
-                f"(from {len(all_entity_ids)} entities, sources: chunk_emb, entity_emb, rel_emb)")
-    return unique_chunks[:top_k]
+    # Ensure source diversity - prioritize chunks from different sources
+    # This ensures we don't get 50 chunks from just 5 sources
+    seen_sources = set()
+    diverse_chunks = []
+    remaining_chunks = []
+    
+    # First pass: get at least one chunk from each unique source (up to top_k sources)
+    for chunk in unique_chunks:
+        source = chunk.get('source', 'unknown')
+        if source not in seen_sources and len(diverse_chunks) < top_k:
+            seen_sources.add(source)
+            diverse_chunks.append(chunk)
+        else:
+            remaining_chunks.append(chunk)
+    
+    # Second pass: fill remaining slots with highest similarity chunks
+    slots_remaining = top_k - len(diverse_chunks)
+    if slots_remaining > 0:
+        diverse_chunks.extend(remaining_chunks[:slots_remaining])
+    
+    logger.info(f"[Entity-lookup] Returning {len(diverse_chunks)} diverse chunks "
+                f"from {len(seen_sources)} unique sources "
+                f"(from {len(all_entity_ids)} entities)")
+    
+    # Apply reranking if enabled
+    if use_rerank and diverse_chunks and rerank_method != "none":
+        try:
+            logger.info(f"[Entity-lookup] Reranking {len(diverse_chunks)} chunks using method: {rerank_method}")
+            diverse_chunks = await rerank_chunks(query, diverse_chunks, method=rerank_method, final_k=top_k)
+            logger.info(f"[Entity-lookup] Reranking complete, returning top {len(diverse_chunks)} chunks")
+        except Exception as e:
+            logger.warning(f"[Entity-lookup] Reranking failed: {e}, using original order")
+    
+    return diverse_chunks
 
 
 async def search_graph_traversal(
@@ -2850,26 +3144,40 @@ async def search_graph_traversal(
     query_embedding: List[float],
     top_k: int = 20,
     max_depth: int = 2,
-    llm_config: dict = None
+    llm_config: dict = None,
+    use_rerank: bool = True,
+    rerank_method: str = "hybrid"
 ) -> List[Dict]:
     """
     Graph-traversal mode: Comprehensive graph-based search using ALL embedding types:
-    - Entity embeddings: Find seed entities for traversal
+    - LLM Entity Extraction & Semantic Matching (NEW): Extract entities and match with database
     - Relationship embeddings: Primary mechanism for relationship-based retrieval
+    - Entity embeddings: Find seed entities for traversal
     - Chunk embeddings: Direct semantic search + entity-linked chunks
     - Graph reasoning: BFS traversal, path finding, and connectivity analysis
     """
     logger.info(f"[Graph-traversal] Starting comprehensive graph search for: {query[:50]}...")
-    
+
     from storage import DistanceMetric
     all_chunks = []
-    
+    matched_entities = []  # Store LLM matched entities
+
+    # =================================================================
+    # LAYER 0: LLM ENTITY EXTRACTION & SEMANTIC MATCHING (NEW)
+    # =================================================================
+    try:
+        matched_entities, _ = await extract_and_match_entities(query, query_embedding, llm_config, logger)
+        logger.info(f"[Graph-traversal] Layer 0 - LLM matched entities: {len(matched_entities)}")
+    except Exception as e:
+        logger.warning(f"[Graph-traversal] Layer 0 (LLM entity extraction) failed: {e}")
+        matched_entities = []
+
     # =================================================================
     # LAYER 1: RELATIONSHIP EMBEDDINGS - Primary relationship-based retrieval
     # =================================================================
     matching_relationships = []
     relationship_entity_ids = set()
-    
+
     try:
         rel_results = await storage.search_relationships(
             query_vector=query_embedding,
@@ -2877,9 +3185,9 @@ async def search_graph_traversal(
             distance_metric=DistanceMetric.COSINE,
             match_threshold=0.4
         )
-        
+
         matching_relationships = rel_results
-        
+
         # Extract all entities from matching relationships
         for rel in rel_results:
             source_id = rel.get('source_id')
@@ -2888,10 +3196,10 @@ async def search_graph_traversal(
                 relationship_entity_ids.add(source_id)
             if target_id:
                 relationship_entity_ids.add(target_id)
-        
+
         logger.info(f"[Graph-traversal] Found {len(rel_results)} relationships via relationship embeddings, "
                     f"covering {len(relationship_entity_ids)} entities")
-        
+
         # Add relationship descriptions as high-value context
         for rel in rel_results:
             desc = rel.get('description')
@@ -2915,19 +3223,178 @@ async def search_graph_traversal(
             
     except Exception as e:
         logger.warning(f"[Graph-traversal] Relationship embedding search failed: {e}")
-    
+
     # =================================================================
-    # LAYER 2: ENTITY EMBEDDINGS - Find seed entities for graph expansion
+    # LAYER 2: ENTITY EMBEDDINGS - Enhanced with entity pairing
     # =================================================================
-    seed_entities = await storage.search_entities(
-        query_vector=query_embedding,
-        limit=15,
-        distance_metric=DistanceMetric.COSINE
-    )
-    
+
+    # Use LLM to extract entities and relationships from the query
+    entity_extraction_prompt = f"""Extract KEY ENTITIES and RELATIONSHIPS from this query: "{query}"
+
+Rules:
+- Only extract NOUNS and ENTITY PHRASES (things, concepts, technologies, etc.)
+- DO NOT extract question words (how, what, why, when, where, which, who)
+- DO NOT extract verbs (use, implement, build, create, explain, describe)
+- DO NOT extract articles (the, a, an) or prepositions (to, of, in, for, with)
+
+Output format (JSON):
+{{
+    "entities": ["entity1", "entity2", "entity3"],
+    "relationships": ["entity1 -> entity2", "entity2 -> entity3"]
+}}
+
+Extract the key entities (max 5) and relationships from this query:"""
+
+    query_entities = []
+    query_relationships = []
+
+    try:
+        llm_response = await llm_complete_with_provider(
+            prompt=entity_extraction_prompt,
+            llm_config=llm_config,
+            max_tokens=500,
+            system_prompt="You are a knowledge graph expert. Extract entities and relationships from queries. Always output valid JSON."
+        )
+
+        # Parse LLM response
+        import json
+        import re
+
+        # Extract JSON from response
+        json_match = re.search(r'\{[\s\S]*\}', llm_response)
+        if json_match:
+            try:
+                extraction = json.loads(json_match.group())
+                query_entities = extraction.get('entities', [])
+                query_relationships = extraction.get('relationships', [])
+                logger.info(f"[Graph-traversal] LLM extracted entities: {query_entities}")
+                logger.info(f"[Graph-traversal] LLM extracted relationships: {query_relationships}")
+            except json.JSONDecodeError as e:
+                logger.warning(f"[Graph-traversal] Failed to parse LLM entity extraction: {e}")
+        else:
+            logger.warning(f"[Graph-traversal] No JSON found in LLM entity extraction response")
+
+    except Exception as e:
+        logger.warning(f"[Graph-traversal] LLM entity extraction failed: {e}, falling back to keyword extraction")
+        # Fallback to keyword extraction
+        try:
+            high_level, low_level = await extract_keywords_for_search(query, llm_config)
+            query_entities = low_level[:5]
+        except:
+            query_entities = []
+
+    all_seed_entities = []
+
+    if len(query_entities) >= 2:
+        # 2a: MULTIPLE ENTITIES → Search for PAIRED entity embeddings using SEMANTIC SIMILARITY
+        logger.info(f"[Graph-traversal] Multiple entities extracted: Using semantic similarity matching")
+
+        SIMILARITY_THRESHOLD = 0.7  # Match entities with similarity > 0.7
+
+        # Map: extracted_entity -> list of matched db_entities (with similarity > threshold)
+        entity_matches = {}  # extracted_entity -> [(db_entity, similarity), ...]
+
+        for extracted_entity in query_entities:
+            try:
+                # Create embedding for the extracted entity
+                entity_embedding = get_ollama_embedding(extracted_entity)
+
+                # Search database entities using the entity embedding
+                matched_db_entities = await storage.search_entities(
+                    query_vector=entity_embedding,
+                    limit=20,
+                    distance_metric=DistanceMetric.COSINE
+                )
+
+                # Filter entities with similarity > threshold
+                matches = []
+                for db_entity in matched_db_entities:
+                    sim = db_entity.get('similarity', 0)
+                    if sim > SIMILARITY_THRESHOLD:
+                        matches.append((db_entity, sim))
+                        logger.info(f"[Graph-traversal] DEBUG: '{extracted_entity}' matched '{db_entity.get('name', '')[:30]}' with similarity {sim:.3f}")
+
+                entity_matches[extracted_entity] = matches
+                logger.info(f"[Graph-traversal] Entity '{extracted_entity}' matched {len(matches)} database entities (sim > {SIMILARITY_THRESHOLD})")
+
+            except Exception as e:
+                logger.warning(f"[Graph-traversal] Failed to match entity '{extracted_entity}': {e}")
+                entity_matches[extracted_entity] = []
+
+        # Now find paired matches: entities that match BOTH extracted entities
+        paired_count = 0
+        partial_count = 0
+
+        # Collect all matched db entities
+        all_matched_ids = set()
+        for matches in entity_matches.values():
+            for db_entity, sim in matches:
+                all_matched_ids.add(db_entity.get('entity_id'))
+
+        logger.info(f"[Graph-traversal] Total unique matched db entities: {len(all_matched_ids)}")
+
+        # Search for all matched entities to get their details
+        for extracted_entity, matches in entity_matches.items():
+            for db_entity, sim in matches:
+                entity_id = db_entity.get('entity_id')
+                if entity_id in all_matched_ids and not any(e.get('entity_id') == entity_id for e in all_seed_entities):
+                    # Boost similarity based on how many extracted entities it matched
+                    num_matches = sum(1 for m in entity_matches.values() if any(e.get('entity_id') == entity_id for e, _ in m))
+
+                    if num_matches >= 2:
+                        # Paired match: matches 2+ extracted entities
+                        db_entity['similarity'] = sim * 1.5
+                        db_entity['paired_with'] = extracted_entity
+                        db_entity['num_entity_matches'] = num_matches
+                        all_seed_entities.append(db_entity)
+                        paired_count += 1
+                        logger.info(f"[Graph-traversal] PAIRED: '{db_entity.get('name', '')[:40]}' matched {num_matches} extracted entities")
+                    else:
+                        # Partial match: matches only 1 extracted entity
+                        db_entity['similarity'] = sim * 1.2
+                        db_entity['partial_match'] = extracted_entity
+                        all_seed_entities.append(db_entity)
+                        partial_count += 1
+
+        # Fallback: If no entities found via semantic matching, use query embedding
+        if not all_seed_entities:
+            logger.info(f"[Graph-traversal] No semantic matches found, falling back to query embedding search")
+            fallback_results = await storage.search_entities(
+                query_vector=query_embedding,
+                limit=30,
+                distance_metric=DistanceMetric.COSINE
+            )
+            all_seed_entities.extend(fallback_results)
+
+        logger.info(f"[Graph-traversal] Found {paired_count} paired entities, {partial_count} partial matches, {len(all_seed_entities)} total")
+    else:
+        # 2b: SINGLE ENTITY → Search for individual entity embedding
+        logger.info(f"[Graph-traversal] Single entity extracted: Searching individual embedding")
+
+        seed_entities_individual = await storage.search_entities(
+            query_vector=query_embedding,
+            limit=15,
+            distance_metric=DistanceMetric.COSINE
+        )
+        all_seed_entities.extend(seed_entities_individual)
+        logger.info(f"[Graph-traversal] Found {len(seed_entities_individual)} individual entity matches")
+
+    # Deduplicate and sort by similarity
+    seen_entity_ids = set()
+    seed_entities = []
+    for entity in all_seed_entities:
+        eid = entity.get('entity_id')
+        if eid and eid not in seen_entity_ids:
+            seen_entity_ids.add(eid)
+            seed_entities.append(entity)
+
+    # Sort by similarity (highest first)
+    seed_entities.sort(key=lambda x: x.get('similarity', 0), reverse=True)
+    seed_entities = seed_entities[:15]  # Limit to top 15
+
     if seed_entities:
-        logger.info(f"[Graph-traversal] Found {len(seed_entities)} seed entities via entity embeddings")
-    
+        logger.info(f"[Graph-traversal] Final seed entities: {len(seed_entities)} (after pairing & deduplication)")
+
     # Combine seed entities with relationship-derived entities
     all_entity_ids = set(e.get('entity_id') for e in seed_entities)
     all_entity_ids.update(relationship_entity_ids)
@@ -3114,16 +3581,51 @@ async def search_graph_traversal(
     # Sort by composite similarity score
     unique_chunks.sort(key=lambda x: x.get('similarity', 0), reverse=True)
     
+    # Ensure source diversity - prioritize chunks from different sources
+    # This ensures we don't get 50 chunks from just 5 sources
+    seen_sources = set()
+    diverse_chunks = []
+    remaining_chunks = []
+    
+    # First pass: get at least one chunk from each unique source (up to top_k sources)
+    for chunk in unique_chunks:
+        source = chunk.get('source', 'unknown')
+        if source not in seen_sources and len(diverse_chunks) < top_k:
+            seen_sources.add(source)
+            diverse_chunks.append(chunk)
+        else:
+            remaining_chunks.append(chunk)
+    
+    # Second pass: fill remaining slots with highest similarity chunks
+    slots_remaining = top_k - len(diverse_chunks)
+    if slots_remaining > 0:
+        diverse_chunks.extend(remaining_chunks[:slots_remaining])
+    
     # Log layer distribution
     layer_counts = {}
-    for chunk in unique_chunks[:top_k]:
+    for chunk in diverse_chunks:
         layer = chunk.get('source_layer', 'unknown')
         layer_counts[layer] = layer_counts.get(layer, 0) + 1
     
-    logger.info(f"[Graph-traversal] Returning {len(unique_chunks[:top_k])} unique chunks "
-                f"from {len(all_entity_ids)} entities. Layer distribution: {layer_counts}")
+    logger.info(f"[Graph-traversal] Returning {len(diverse_chunks)} diverse chunks "
+                f"from {len(seen_sources)} unique sources "
+                f"(from {len(all_entity_ids)} entities). Layer distribution: {layer_counts}")
     
-    return unique_chunks[:top_k]
+    # === RERANKING: Apply configured reranking method ===
+    if use_rerank and diverse_chunks and rerank_method != "none":
+        try:
+            logger.info(f"[Graph-traversal] Reranking {len(diverse_chunks)} chunks using method: {rerank_method}")
+            diverse_chunks = await rerank_chunks(
+                query, 
+                diverse_chunks, 
+                method=rerank_method, 
+                final_k=top_k
+            )
+            logger.info(f"[Graph-traversal] Reranking complete, returning top {len(diverse_chunks)} chunks")
+        except Exception as e:
+            logger.warning(f"[Graph-traversal] Reranking failed: {e}, using original order")
+    
+    return diverse_chunks
 
 
 # ============ Chat ============
@@ -4135,6 +4637,13 @@ MANDATORY:
                 except Exception as e:
                     print(f"[ACADEMIC REVIEW ERROR] {e}")
             
+            # DEBUG: Log cited sources count
+            print(f"[DEBUG] ========== CITED SOURCES SUMMARY ==========")
+            print(f"[DEBUG] Mode: {mode}, Detail: {detail_level}")
+            print(f"[DEBUG] Unique sources in response: {len(unique_sources)}")
+            print(f"[DEBUG] Sources: {unique_sources[:10]}")
+            print(f"[DEBUG] ==========================================")
+
             return {
                 "response": final_response,
                 "answer": final_response,
@@ -4861,57 +5370,303 @@ async def chat_stream(request: dict):
             "error": "Please enter a question to search the knowledge base."
         }, status_code=400)
     
-    # Use semantic search with STRICT threshold (0.5)
+    # Generate query embedding (needed for all modes)
     query_embedding = get_ollama_embedding(query)
-    top_k = 30 if is_ultra else 20
-    
+
+    # Determine search top_k based on detail level and mode
+    # Need more chunks because many may be from same source (deduplication)
+    # Increased limits to ensure comprehensive coverage
+    if is_ultra:
+        # Ultra-Deep: Maximum coverage for thorough analysis
+        search_top_k = 2000
+    elif is_comprehensive:
+        # Comprehensive: High coverage for detailed responses
+        search_top_k = 1000
+    else:
+        # Quick vs Balanced distinction: infer from top_k value
+        # Frontend sends: Quick=10, Balanced=20, Comprehensive=30, Ultra=40
+        request_top_k = request.get("top_k", 20)
+        if request_top_k < 20:
+            # Quick mode (top_k < 20 means Quick)
+            search_top_k = 500
+        else:
+            # Balanced mode (top_k >= 20 means Balanced or higher but handled above)
+            search_top_k = 800
+
+    # DEBUG: Log detail level detection
+    print(f"[DEBUG] Detail Level Detection: is_ultra={is_ultra}, is_comprehensive={is_comprehensive}, request_top_k={request.get('top_k', 20)}, search_top_k={search_top_k}", flush=True)
+
+    # =================================================================
+    # STEP 1: SEARCH BASED ON MODE (respect user's search mode choice)
+    # =================================================================
+
     result = []
-    try:
-        from storage import DistanceMetric
-        chunk_results = await storage.search_chunks(
-            query_vector=query_embedding,
-            limit=top_k,
-            distance_metric=DistanceMetric.COSINE,
-            match_threshold=0.5  # STRICT: Search threshold 0.5
-        )
-        for chunk in chunk_results:
-            result.append({
-                'id': chunk.chunk_id,
-                'content': chunk.content,
-                'source': chunk.source,
-                'similarity': chunk.similarity
-            })
-    except Exception as e:
-        rerank_logger.error(f"[chat_stream] Search failed: {e}")
+    max_depth = request.get("max_depth", 2)
     
-    # STRICT FILTERING: Only keep sources with similarity >= 0.7
-    similarity_threshold = 0.7
+    if mode == "smart":
+        # Smart mode: Multi-layer unified search
+        try:
+            result = await search_smart(
+                query=query,
+                query_embedding=query_embedding,
+                top_k=search_top_k,
+                llm_config=llm_config
+            )
+
+            # DEBUG: Log similarity scores for analysis
+            print(f"[DEBUG] ========== SMART SEARCH SCORES ==========", flush=True)
+            print(f"[DEBUG] Mode: smart, is_ultra={is_ultra}, is_comprehensive={is_comprehensive}, search_top_k={search_top_k}", flush=True)
+            print(f"[DEBUG] match_threshold used: 0.5", flush=True)
+            print(f"[DEBUG] Total chunks returned: {len(result)}", flush=True)
+            if result:
+                similarities = [r.get('similarity', 0) for r in result]
+                unique_sources = set(r.get('source', 'unknown') for r in result)
+                print(f"[DEBUG] Unique sources: {len(unique_sources)}", flush=True)
+                print(f"[DEBUG] Min similarity: {min(similarities):.4f}", flush=True)
+                print(f"[DEBUG] Max similarity: {max(similarities):.4f}", flush=True)
+                print(f"[DEBUG] Avg similarity: {sum(similarities)/len(similarities):.4f}", flush=True)
+                print(f"[DEBUG] Chunks with similarity >= 0.7: {sum(1 for s in similarities if s >= 0.7)}", flush=True)
+                print(f"[DEBUG] Chunks with similarity >= 0.5: {sum(1 for s in similarities if s >= 0.5)}", flush=True)
+                print(f"[DEBUG] Chunks with similarity >= 0.3: {sum(1 for s in similarities if s >= 0.3)}", flush=True)
+                print(f"[DEBUG] ========== Top 10 chunks by similarity ==========", flush=True)
+                sorted_results = sorted(result, key=lambda x: x.get('similarity', 0), reverse=True)[:10]
+                for i, r in enumerate(sorted_results):
+                    print(f"[DEBUG]   {i+1}. Score: {r.get('similarity', 0):.4f} | Source: {r.get('source', 'unknown')[:50]}", flush=True)
+            print(f"[DEBUG] ===========================================", flush=True)
+        except Exception as e:
+            print(f"[chat_stream] Smart mode failed: {e}, falling back to semantic")
+            mode = "semantic"
+    
+    elif mode == "entity-lookup":
+        # Entity-centric search
+        try:
+            result = await search_entity_lookup(
+                query=query,
+                query_embedding=query_embedding,
+                top_k=search_top_k,
+                llm_config=llm_config
+            )
+            print(f"[chat_stream] Entity-lookup returned {len(result)} chunks", flush=True)
+
+            # DEBUG: Log similarity scores for analysis
+            print(f"[DEBUG] ========== ENTITY-LOOKUP SEARCH SCORES ==========", flush=True)
+            print(f"[DEBUG] Mode: entity-lookup, is_ultra={is_ultra}, is_comprehensive={is_comprehensive}, search_top_k={search_top_k}", flush=True)
+            print(f"[DEBUG] match_threshold used: 0.5", flush=True)
+            print(f"[DEBUG] Total chunks returned: {len(result)}", flush=True)
+            if result:
+                similarities = [r.get('similarity', 0) for r in result]
+                unique_sources = set(r.get('source', 'unknown') for r in result)
+                print(f"[DEBUG] Unique sources: {len(unique_sources)}", flush=True)
+                print(f"[DEBUG] Min similarity: {min(similarities):.4f}", flush=True)
+                print(f"[DEBUG] Max similarity: {max(similarities):.4f}", flush=True)
+                print(f"[DEBUG] Avg similarity: {sum(similarities)/len(similarities):.4f}", flush=True)
+                print(f"[DEBUG] Chunks with similarity >= 0.7: {sum(1 for s in similarities if s >= 0.7)}", flush=True)
+                print(f"[DEBUG] Chunks with similarity >= 0.5: {sum(1 for s in similarities if s >= 0.5)}", flush=True)
+                print(f"[DEBUG] Chunks with similarity >= 0.3: {sum(1 for s in similarities if s >= 0.3)}", flush=True)
+            print(f"[DEBUG] ===========================================", flush=True)
+        except Exception as e:
+            print(f"[chat_stream] Entity-lookup failed: {e}, falling back to semantic")
+            mode = "semantic"
+
+    elif mode == "graph-traversal":
+        # Graph-based traversal search
+        try:
+            result = await search_graph_traversal(
+                query=query,
+                query_embedding=query_embedding,
+                top_k=search_top_k,
+                max_depth=max_depth,
+                llm_config=llm_config
+            )
+            print(f"[chat_stream] Graph-traversal returned {len(result)} chunks", flush=True)
+
+            # DEBUG: Log similarity scores for analysis
+            print(f"[DEBUG] ========== GRAPH-TRAVERSAL SEARCH SCORES ==========", flush=True)
+            print(f"[DEBUG] Mode: graph-traversal, is_ultra={is_ultra}, is_comprehensive={is_comprehensive}, search_top_k={search_top_k}", flush=True)
+            print(f"[DEBUG] match_threshold used: 0.5", flush=True)
+            print(f"[DEBUG] Total chunks returned: {len(result)}", flush=True)
+            if result:
+                similarities = [r.get('similarity', 0) for r in result]
+                unique_sources = set(r.get('source', 'unknown') for r in result)
+                print(f"[DEBUG] Unique sources: {len(unique_sources)}", flush=True)
+                print(f"[DEBUG] Min similarity: {min(similarities):.4f}", flush=True)
+                print(f"[DEBUG] Max similarity: {max(similarities):.4f}", flush=True)
+                print(f"[DEBUG] Avg similarity: {sum(similarities)/len(similarities):.4f}", flush=True)
+                print(f"[DEBUG] Chunks with similarity >= 0.7: {sum(1 for s in similarities if s >= 0.7)}", flush=True)
+                print(f"[DEBUG] Chunks with similarity >= 0.5: {sum(1 for s in similarities if s >= 0.5)}", flush=True)
+                print(f"[DEBUG] Chunks with similarity >= 0.3: {sum(1 for s in similarities if s >= 0.3)}", flush=True)
+            print(f"[DEBUG] ===========================================", flush=True)
+        except Exception as e:
+            print(f"[chat_stream] Graph-traversal failed: {e}, falling back to semantic", flush=True)
+            mode = "semantic"
+
+    # Fallback to semantic search if mode not handled or if search failed
+    if mode in ("semantic", "semantic-hybrid") or not result:
+        try:
+            from storage import DistanceMetric
+            max_db_sources = 10  # Maximum sources for diverse search
+
+            # For Ultra mode: Use source-diverse search to maximize unique sources
+            if is_ultra:
+                # First pass: Get top chunk from each unique source
+                diverse_results = await storage.search_chunks_diverse(
+                    query_vector=query_embedding,
+                    limit=max_db_sources,  # Get up to 10 sources
+                    min_similarity=0.5,
+                    max_per_source=2  # Max 2 chunks per source initially
+                )
+                
+                # Second pass: Fill remaining slots with regular search, excluding already found sources
+                found_sources = set(r.source for r in diverse_results if r.source)
+                remaining_slots = search_top_k - len(diverse_results)
+                
+                if remaining_slots > 0:
+                    chunk_results = await storage.search_chunks(
+                        query_vector=query_embedding,
+                        limit=remaining_slots * 2,  # Get extra to account for duplicates
+                        distance_metric=DistanceMetric.COSINE,
+                        match_threshold=0.5
+                    )
+                    # Add chunks from new sources first
+                    for chunk in chunk_results:
+                        if chunk.source not in found_sources and len(diverse_results) < search_top_k:
+                            diverse_results.append(chunk)
+                            found_sources.add(chunk.source)
+                    
+                    # If still have room, add best remaining chunks regardless of source
+                    for chunk in chunk_results:
+                        if len(diverse_results) < search_top_k:
+                            diverse_results.append(chunk)
+                
+                chunk_results = diverse_results
+                print(f"[chat_stream] Ultra semantic: source-diverse search returned {len(chunk_results)} chunks from {len(found_sources)} sources")
+            else:
+                # Standard search for non-Ultra modes
+                chunk_results = await storage.search_chunks(
+                    query_vector=query_embedding,
+                    limit=search_top_k,
+                    distance_metric=DistanceMetric.COSINE,
+                    match_threshold=0.5
+                )
+            
+            for chunk in chunk_results:
+                result.append({
+                    'id': chunk.chunk_id,
+                    'content': chunk.content,
+                    'source': chunk.source,
+                    'similarity': chunk.similarity
+                })
+
+            # DEBUG: Log similarity scores for analysis
+            print(f"[DEBUG] ========== SEMANTIC SEARCH SCORES ==========", flush=True)
+            print(f"[DEBUG] Mode: semantic, is_ultra={is_ultra}, is_comprehensive={is_comprehensive}, search_top_k={search_top_k}", flush=True)
+            print(f"[DEBUG] match_threshold used: 0.5", flush=True)
+            print(f"[DEBUG] Total chunks returned: {len(result)}", flush=True)
+            if result:
+                similarities = [r.get('similarity', 0) for r in result]
+                unique_sources = set(r.get('source', 'unknown') for r in result)
+                print(f"[DEBUG] Unique sources: {len(unique_sources)}", flush=True)
+                print(f"[DEBUG] Min similarity: {min(similarities):.4f}", flush=True)
+                print(f"[DEBUG] Max similarity: {max(similarities):.4f}", flush=True)
+                print(f"[DEBUG] Avg similarity: {sum(similarities)/len(similarities):.4f}", flush=True)
+                print(f"[DEBUG] Chunks with similarity >= 0.7: {sum(1 for s in similarities if s >= 0.7)}", flush=True)
+                print(f"[DEBUG] Chunks with similarity >= 0.5: {sum(1 for s in similarities if s >= 0.5)}", flush=True)
+                print(f"[DEBUG] Chunks with similarity >= 0.3: {sum(1 for s in similarities if s >= 0.3)}", flush=True)
+                print(f"[DEBUG] ========== Top 10 chunks by similarity ==========", flush=True)
+                sorted_results = sorted(result, key=lambda x: x.get('similarity', 0), reverse=True)[:10]
+                for i, r in enumerate(sorted_results):
+                    print(f"[DEBUG]   {i+1}. Score: {r.get('similarity', 0):.4f} | Source: {r.get('source', 'unknown')[:50]}", flush=True)
+            print(f"[DEBUG] ==============================================", flush=True)
+        except Exception as e:
+            rerank_logger.error(f"[chat_stream] Search failed: {e}")
+    
+    # =================================================================
+    # STEP 2: SOURCE DIVERSITY (for all modes)
+    # Apply before reranking to ensure reranker sees diverse sources
+    # =================================================================
+    
+    if result:
+        # Sort by similarity first
+        result.sort(key=lambda x: x.get('similarity', 0), reverse=True)
+        
+        seen_sources_diverse = set()
+        diverse_result = []
+        remaining_result = []
+        
+        # First pass: get at least one chunk from each unique source
+        for chunk in result:
+            source = chunk.get('source', 'unknown')
+            if source not in seen_sources_diverse:
+                seen_sources_diverse.add(source)
+                diverse_result.append(chunk)
+            else:
+                remaining_result.append(chunk)
+        
+        # Second pass: fill remaining slots with highest similarity chunks
+        # Keep up to search_top_k total chunks
+        slots_remaining = search_top_k - len(diverse_result)
+        if slots_remaining > 0:
+            diverse_result.extend(remaining_result[:slots_remaining])
+        
+        result = diverse_result
+        print(f"[chat_stream] Source diversity: {len(result)} chunks from {len(seen_sources_diverse)} unique sources")
+    
+    # =================================================================
+    # STEP 3: RERANKING (for all modes)
+    # Rerank the diverse chunks for better relevance ordering
+    # =================================================================
+    
+    # Get rerank settings from request or use defaults
+    use_rerank = request.get("rerank", RERANK_CONFIG.enabled)
+    rerank_method = request.get("rerank_method", RERANK_CONFIG.method)
+    
+    if use_rerank and result and rerank_method != "none":
+        try:
+            rerank_logger.info(f"[chat_stream] Reranking {len(result)} chunks using method: {rerank_method}")
+            result = await rerank_chunks(query, result, method=rerank_method, final_k=search_top_k)
+            rerank_logger.info(f"[chat_stream] Reranking complete, returning top {len(result)} chunks")
+        except Exception as e:
+            rerank_logger.warning(f"[chat_stream] Reranking failed: {e}, using original order")
+    
+    # STRICT FILTERING: Only keep sources with high relevance score >= 0.7
+    # Use rerank_score if available (after reranking), otherwise fall back to similarity
+    relevance_threshold = 0.7
     min_quality_sources = 5
-    max_db_sources = 10  # Increased from default to show more high-quality sources
+    max_db_sources = 10  # Maximum 10 database sources
+    
+    # DEBUG: Log what we have before filtering
+    unique_sources_before = len(set(r.get('source', 'unknown') for r in result))
+    print(f"[chat_stream] BEFORE filtering: {len(result)} chunks from {unique_sources_before} unique sources", flush=True)
+    if result:
+        scores = [r.get('rerank_score', r.get('similarity', 0.5)) for r in result]
+        print(f"[chat_stream] Score range: {min(scores):.3f} - {max(scores):.3f}, avg: {sum(scores)/len(scores):.3f}", flush=True)
     
     # Build sources list with deduplication and strict filtering
     sources = []
     seen_sources = set()
     for r in result:
         source_name = r.get('source', 'unknown')
-        similarity = r.get('similarity', 0.5)
+        # Use rerank_score if available (from reranking), otherwise fall back to similarity
+        relevance_score = r.get('rerank_score', r.get('similarity', 0.5))
         
         # Skip duplicates
         if source_name in seen_sources:
             continue
         
         # STRICT: Only keep high-quality sources (>= 0.7)
-        if similarity < similarity_threshold:
+        if relevance_score < relevance_threshold:
             continue
             
         seen_sources.add(source_name)
         sources.append({
             'source': source_name,
             'content': r.get('content', ''),
-            'similarity': similarity
+            'similarity': relevance_score  # Use the relevance score for display
         })
         if len(sources) >= max_db_sources:
             break
+    
+    print(f"[chat_stream] AFTER filtering at {relevance_threshold}: {len(sources)} sources (mode={mode}, ultra={is_ultra})")
     
     # LLM KNOWLEDGE FALLBACK: If fewer than 5 high-quality sources
     use_llm_references = len(sources) < min_quality_sources

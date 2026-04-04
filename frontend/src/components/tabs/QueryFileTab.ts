@@ -132,12 +132,24 @@ function printAnswer(event?: Event): void {
   // Both screen and print now show the FULL content without truncation.
   
   // Format markdown-style headings and bold text
+  // NOTE: Preserve <i> and <em> tags BEFORE escaping HTML entities
   let formattedAnswer = processedText
+    // Preserve <i>...</i> tags by converting to placeholder
+    .replace(/<i>([\s\S]*?)<\/i>/gi, '__ITALIC_START__$1__ITALIC_END__')
+    // Preserve <em>...</em> tags by converting to placeholder
+    .replace(/<em>([\s\S]*?)<\/em>/gi, '__EM_START__$1__EM_END__')
+    // Escape HTML entities
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     // Convert **text** to bold
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    // Restore <i> tags
+    .replace(/__ITALIC_START__/g, '<i>')
+    .replace(/__ITALIC_END__/g, '</i>')
+    // Restore <em> tags
+    .replace(/__EM_START__/g, '<em>')
+    .replace(/__EM_END__/g, '</em>');
   
   // Process headings line by line for proper numbering
   const lines = formattedAnswer.split('\n');
@@ -302,6 +314,7 @@ function printAnswer(event?: Event): void {
         font-style: italic;
       }
       strong { font-weight: bold; }
+      em, i { font-style: italic; }
       /* New HTML tag styles for standard format */
       query-h1 {
         display: block;
@@ -484,6 +497,7 @@ function printAnswer(event?: Event): void {
         font-style: italic;
       }
       strong { font-weight: bold; }
+      em, i { font-style: italic; }
       /* New HTML tag styles for standard format - screen view */
       query-h1 {
         display: block;

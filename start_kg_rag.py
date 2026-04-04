@@ -52,7 +52,7 @@ class KGRAGConfig:
     def _default_config(self) -> Dict:
         return {
             'services': {
-                'backend': {'enabled': True, 'port': 8002, 'host': '127.0.0.1', 
+                'backend': {'enabled': True, 'port': 8002, 'host': '127.0.0.1',
                            'script': 'pgvector_api.py', 'directory': 'backend',
                            'startup_timeout': 30},
                 'frontend': {'enabled': True, 'port': 8081, 'host': True,
@@ -61,11 +61,12 @@ class KGRAGConfig:
                                      'script': 'scripts/db-management-api.cjs',
                                      'directory': 'frontend', 'startup_timeout': 10}
             },
-            'ollama': {'enabled': True, 'host': 'http://localhost', 'port': 11434, 
+            'ollama': {'enabled': True, 'host': 'http://localhost', 'port': 11434,
                       'required_models': ['nomic-embed-text']},
             'database_health': {'min_entities': 1000, 'min_relationships': 1000,
                                'min_chunks': 1000, 'min_documents': 10},
-            'logging': {'level': 'INFO'}
+            'logging': {'level': 'INFO'},
+            'security': {'api_key': os.getenv('KGRAG_API_KEY', 'dev-only-key')}
         }
     
     def _apply_env_overrides(self):
@@ -73,6 +74,7 @@ class KGRAGConfig:
             'KGRAG_BACKEND_PORT': ['services', 'backend', 'port'],
             'KGRAG_FRONTEND_PORT': ['services', 'frontend', 'port'],
             'KGRAG_DB_API_PORT': ['services', 'db_management_api', 'port'],
+            'KGRAG_API_KEY': ['security', 'api_key'],
         }
         for env_var, path in env_mappings.items():
             value = os.getenv(env_var)

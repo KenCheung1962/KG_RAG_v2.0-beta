@@ -37,7 +37,7 @@ services:
   db_management_api:
     enabled: true
     port: 8013
-    script: "scripts/db_management_api.cjs"
+    script: "scripts/db-management-api.cjs"
     directory: "frontend"
     log_file: "db-api.log"
     startup_timeout: 10
@@ -156,8 +156,10 @@ features:
 #------------------------------------------------------------------------------
 security:
   # API Key for internal communication
-  api_key: "static-internal-key"
-  
+  # IMPORTANT: Set via environment variable KGRAG_API_KEY in production!
+  # Default is for development only - do not use in production
+  api_key_env_var: "KGRAG_API_KEY"
+
   # CORS settings
   cors:
     enabled: true
@@ -261,3 +263,4 @@ notifications:
 # - KGRAG_OLLAMA_HOST (overrides ollama.host)
 # - KGRAG_LOG_LEVEL (overrides logging.level)
 # - KGRAG_DEBUG_MODE (overrides features.debug_mode)
+# - KGRAG_API_KEY (API key for internal communication - REQUIRED in production)
